@@ -18,3 +18,10 @@ data/
 
 # Virtual environments
 .venv
+
+# Frontend
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.env*.local
+*.tsbuildinfo
