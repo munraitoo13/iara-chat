@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     cors_origins: str = (
         "http://localhost:3000,http://127.0.0.1:3000,http://localhost:8000,http://127.0.0.1:8000"
     )
+    cors_origin_regex: str = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
     api_host: str = "127.0.0.1"
     api_port: int = 8000
     staff_api_key: SecretStr | None = None
@@ -60,6 +61,12 @@ class Settings(BaseSettings):
         """Return comma-separated CORS origins allowed to call the API."""
 
         return [item.strip() for item in self.cors_origins.split(",") if item.strip()]
+
+    def configured_cors_origin_regex(self) -> str | None:
+        """Return optional regex matching allowed CORS origins (e.g., localhost dev ports)."""
+
+        cleaned = self.cors_origin_regex.strip()
+        return cleaned or None
 
     def active_model_name(self) -> str:
         """Return the model identifier for the active LLM provider."""

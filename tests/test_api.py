@@ -48,6 +48,31 @@ def test_health_and_web_chat_index(tmp_path: Path) -> None:
         assert "Ficha de Pré-Cadastro" in index_res.text
 
 
+def test_cors_allows_arbitrary_localhost_dev_ports(tmp_path: Path) -> None:
+    settings = _build_test_settings(tmp_path)
+    app = create_app(settings=settings, llm=FakeApiLLM([]))
+
+    with TestClient(app) as client:
+        preflight = client.options(
+            "/api/v1/sessions",
+            headers={
+                "Origin": "http://localhost:3001",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "content-type",
+            },
+        )
+        assert preflight.status_code == 200
+        assert preflight.headers.get("access-control-allow-origin") == "http://localhost:3001"
+
+        health = client.get("/api/v1/health", headers={"Origin": "http://127.0.0.1:3001"})
+        assert health.status_code == 200
+        assert health.headers.get("access-control-allow-origin") == "http://127.0.0.1:3001"
+
+        blocked = client.get("/api/v1/health", headers={"Origin": "https://evil.example.com"})
+        assert blocked.status_code == 200
+        assert "access-control-allow-origin" not in blocked.headers
+
+
 def test_full_api_lifecycle_persistence_quick_replies_and_lgpd_delete(tmp_path: Path) -> None:
     settings = _build_test_settings(tmp_path)
     llm = FakeApiLLM(

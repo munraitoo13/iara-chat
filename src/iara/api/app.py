@@ -122,10 +122,12 @@ def create_app(
     )
 
     cors_origins = active_settings.parsed_cors_origins()
-    if cors_origins:
+    cors_origin_regex = active_settings.configured_cors_origin_regex()
+    if cors_origins or cors_origin_regex:
         app.add_middleware(
             CORSMiddleware,
             allow_origins=cors_origins,
+            allow_origin_regex=cors_origin_regex,
             allow_credentials=True,
             allow_methods=["*"],
             allow_headers=["*"],
