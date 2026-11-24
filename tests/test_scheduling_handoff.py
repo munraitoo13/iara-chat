@@ -323,3 +323,124 @@ def test_session_inactivity_timeout_expires_open_and_takeover_sessions(tmp_path:
         )
         assert takeover_expired.status_code == 409
         assert repo.list_appointments() == []
+
+
+def test_staff_copilot_patient_edit_offer_slots_and_direct_booking(tmp_path: Path) -> None:
+    settings = _make_settings(tmp_path)
+    llm = StubLLM(
+        [
+            TurnAnalysis(
+                extracted=ExtractedPatientFields(
+                    full_name="Patrícia Gomes",
+                    date_of_birth_iso="1993-04-18",
+                    address="Rua Verde, 15, Curitiba - PR",
+                    coverage_type="particular",
+                    chief_complaint="Manchas vermelhas na pele",
+                )
+            )
+        ]
+    )
+    app = create_app(settings=settings, llm=llm)
+
+    with TestClient(app) as client:
+        s1 = client.post("/api/v1/sessions").json()["session_id"]
+        s2 = client.post("/api/v1/sessions").json()["session_id"]
+
+        # Patient requests human immediately and talks with human agent
+        client.post(f"/api/v1/sessions/{s1}/messages", json={"message": "Falar com atendente"})
+        client.post(
+            f"/api/v1/staff/sessions/{s1}/takeover",
+            json={"staff_name": "Recepção Ana"},
+        )
+        client.post(
+            f"/api/v1/sessions/{s1}/messages",
+            json={
+                "message": (
+                    "Sou Patrícia Gomes, 18/04/1993, Rua Verde 15 Curitiba, "
+                    "particular, manchas na pele"
+                )
+            },
+        )
+        transcript_before = len(client.get(f"/api/v1/sessions/{s1}").json()["messages"])
+
+        # 1. Silent AI Copilot extracts data without messaging patient or mutating transcript
+        extracted = client.post(f"/api/v1/staff/sessions/{s1}/extract")
+        assert extracted.status_code == 200
+        ext_body = extracted.json()
+        assert ext_body["extracted_patient"]["full_name"] == "Patrícia Gomes"
+        assert ext_body["suggested_specialty"] == "dermatologia"
+        assert len(client.get(f"/api/v1/sessions/{s1}").json()["messages"]) == transcript_before
+
+        # 2. Staff saves patient form (switching convenio -> particular clears insurance fields)
+        patched = client.patch(
+            f"/api/v1/staff/sessions/{s1}/patient",
+            json={
+                "full_name": "Patrícia Gomes",
+                "date_of_birth": "1993-04-18",
+                "address": "Rua Verde, 15, Curitiba - PR",
+                "coverage_type": "convenio",
+                "insurance_payer": "Unimed",
+                "insurance_id": "UN12345",
+                "chief_complaint": "Manchas vermelhas na pele",
+                "preferred_specialty": "dermatologia",
+            },
+        )
+        assert patched.status_code == 200
+        assert patched.json()["patient_info"]["insurance_payer"] == "Unimed"
+
+        patched_private = client.patch(
+            f"/api/v1/staff/sessions/{s1}/patient",
+            json={"coverage_type": "particular"},
+        )
+        assert patched_private.status_code == 200
+        assert patched_private.json()["patient_info"]["insurance_payer"] is None
+        assert patched_private.json()["patient_info"]["insurance_id"] is None
+
+        # 3. Staff offers slots into chat -> patient clicks chip (0 tokens)
+        offered = client.post(
+            f"/api/v1/staff/sessions/{s1}/offer-slots",
+            json={"specialty": "dermatologia"},
+        )
+        assert offered.status_code == 200
+        assert offered.json()["status"] == "scheduling"
+        chip_value = offered.json()["quick_replies"][0]["value"]
+        assert chip_value.startswith("slot:")
+
+        booked_by_patient = client.post(
+            f"/api/v1/sessions/{s1}/messages",
+            json={"message": chip_value},
+        )
+        assert booked_by_patient.status_code == 200
+        assert booked_by_patient.json()["reply"]["status"] == "completed"
+        assert booked_by_patient.json()["reply"]["used_llm"] is False
+
+        # 4. Direct staff booking on session 2 + 409 conflict on double booking
+        client.post(f"/api/v1/sessions/{s2}/messages", json={"message": "Quero atendente"})
+        client.post(
+            f"/api/v1/staff/sessions/{s2}/takeover",
+            json={"staff_name": "Recepção Ana"},
+        )
+        client.patch(
+            f"/api/v1/staff/sessions/{s2}/patient",
+            json={"full_name": "Ricardo Alves"},
+        )
+        free_slot = client.get("/api/v1/slots", params={"specialty": "cardiologia"}).json()[0]
+
+        direct = client.post(
+            f"/api/v1/staff/sessions/{s2}/book",
+            json={"slot_id": free_slot["slot_id"], "staff_name": "Recepção Ana"},
+        )
+        assert direct.status_code == 200
+        direct_body = direct.json()
+        assert direct_body["status"] == "completed"
+        assert direct_body["is_finished"] is True
+        assert direct_body["booked_appointment"]["slot_id"] == free_slot["slot_id"]
+        assert direct_body["messages"][-1]["actor"] == "human_agent"
+
+        # Attempting to book same slot again returns 409 Conflict
+        s3 = client.post("/api/v1/sessions").json()["session_id"]
+        conflict = client.post(
+            f"/api/v1/staff/sessions/{s3}/book",
+            json={"slot_id": free_slot["slot_id"], "staff_name": "Recepção Ana"},
+        )
+        assert conflict.status_code == 409

@@ -112,3 +112,20 @@ export interface StaffSessionSummary {
   booked_appointment: BookedAppointmentDTO | null;
   updated_at: string;
 }
+
+export interface StaffUpdatePatientRequest {
+  full_name?: string | null;
+  date_of_birth?: string | null;
+  address?: string | null;
+  coverage_type?: CoverageType | null;
+  insurance_payer?: string | null;
+  insurance_id?: string | null;
+  chief_complaint?: string | null;
+  preferred_specialty?: Specialty | null;
+}
+
+export interface StaffExtractResponse {
+  extracted_patient: PatientInfo;
+  suggested_specialty: Specialty;
+  warnings: string[];
+}

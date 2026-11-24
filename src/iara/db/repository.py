@@ -22,6 +22,7 @@ from iara.models.scheduling import (
     AppointmentSlotDTO,
     BookedAppointmentDTO,
     Specialty,
+    suggest_specialty_from_complaint,
 )
 
 _CLINIC_TZ = ZoneInfo("America/Sao_Paulo")
@@ -637,6 +638,172 @@ class SessionRepository:
                         created_at=now,
                     )
                 )
+            db.commit()
+
+        return self.load_session(session_id)
+
+    def staff_update_patient(
+        self,
+        session_id: str,
+        updates: dict[str, object],
+    ) -> LoadedSession | None:
+        """Update structured patient fields manually or after copilot review."""
+
+        self.expire_stale_sessions()
+        with Session(self.engine) as db:
+            record = db.get(IntakeSessionRecord, session_id)
+            if record is None:
+                return None
+            if record.status in (
+                ConversationStatus.EXPIRED.value,
+                ConversationStatus.EMERGENCY.value,
+            ):
+                raise ValueError("Cannot update patient details on an expired/emergency session.")
+
+            allowed = {
+                "full_name",
+                "date_of_birth",
+                "address",
+                "coverage_type",
+                "insurance_payer",
+                "insurance_id",
+                "chief_complaint",
+                "preferred_specialty",
+            }
+            for key, value in updates.items():
+                if key not in allowed:
+                    continue
+                if isinstance(value, (CoverageType, Specialty)):
+                    setattr(record, key, value.value)
+                elif isinstance(value, str):
+                    setattr(record, key, value.strip() or None)
+                else:
+                    setattr(record, key, value)
+
+            if record.coverage_type == CoverageType.PRIVATE.value:
+                record.insurance_payer = None
+                record.insurance_id = None
+
+            record.updated_at = datetime.now(UTC)
+            db.add(record)
+            db.commit()
+
+        return self.load_session(session_id)
+
+    def staff_book_appointment(
+        self,
+        session_id: str,
+        slot_id: int,
+        staff_name: str,
+    ) -> LoadedSession | None:
+        """Book a calendar slot directly from staff dashboard and confirm in chat."""
+
+        self.expire_stale_sessions()
+        with Session(self.engine) as db:
+            record = db.get(IntakeSessionRecord, session_id)
+            if record is None:
+                return None
+            if record.status in (
+                ConversationStatus.EXPIRED.value,
+                ConversationStatus.EMERGENCY.value,
+            ):
+                raise ValueError("Cannot book an appointment for an expired or emergency session.")
+            patient_name = record.full_name or "Paciente"
+
+        booked = self.book_slot(session_id, slot_id, patient_name)
+        if booked is None:
+            raise ValueError("Horário indisponível ou já reservado.")
+
+        protocol = booked.appointment_id[:8].upper()
+        date_str = booked.starts_at.strftime("%d/%m/%Y às %H:%M")
+        confirmation_msg = (
+            f"Agendamento confirmado por {staff_name.strip()}!\n\n"
+            f"- Protocolo: #{protocol}\n"
+            f"- Especialidade: {booked.specialty_label}\n"
+            f"- Profissional: {booked.doctor_name}\n"
+            f"- Data e hora: {date_str}"
+        )
+
+        with Session(self.engine) as db:
+            record = db.get(IntakeSessionRecord, session_id)
+            if record is None:
+                return None
+            now = datetime.now(UTC)
+            record.status = ConversationStatus.COMPLETED.value
+            record.preferred_specialty = booked.specialty.value
+            record.assigned_staff_name = staff_name.strip()
+            record.updated_at = now
+            db.add(record)
+            db.add(
+                TranscriptMessageRecord(
+                    session_id=session_id,
+                    actor="human_agent",
+                    message=confirmation_msg,
+                    used_llm=False,
+                    created_at=now,
+                )
+            )
+            db.commit()
+
+        return self.load_session(session_id)
+
+    def staff_offer_slots_in_chat(
+        self,
+        session_id: str,
+        specialty: Specialty | None = None,
+    ) -> LoadedSession | None:
+        """Send available calendar slot chips into patient chat for 1-click selection."""
+
+        loaded = self.load_session(session_id)
+        if loaded is None:
+            return None
+        if loaded.state.status in (
+            ConversationStatus.COMPLETED,
+            ConversationStatus.EMERGENCY,
+            ConversationStatus.EXPIRED,
+        ):
+            raise ValueError("Cannot offer slots on a finished or expired session.")
+
+        target_specialty = (
+            specialty
+            or loaded.state.patient_info.preferred_specialty
+            or suggest_specialty_from_complaint(loaded.state.patient_info.chief_complaint)
+        )
+        slots = self.list_available_slots(specialty=target_specialty, limit=4)
+        if not slots:
+            slots = self.list_available_slots(specialty=None, limit=4)
+        if not slots:
+            raise ValueError("Não há horários disponíveis na agenda.")
+
+        slot_lines = [
+            f"{idx}. {slot.display_label} ({slot.specialty_label})"
+            for idx, slot in enumerate(slots, start=1)
+        ]
+        offer_msg = (
+            f"Separei estes horários disponíveis em **{SPECIALTY_LABELS_PTBR[target_specialty]}**:"
+            "\n\n" + "\n".join(slot_lines) + "\n\nClique em um horário abaixo ou digite o número."
+        )
+
+        with Session(self.engine) as db:
+            record = db.get(IntakeSessionRecord, session_id)
+            if record is None:
+                return None
+            now = datetime.now(UTC)
+            record.status = ConversationStatus.SCHEDULING.value
+            record.preferred_specialty = target_specialty.value
+            record.handoff_reason = None
+            record.assigned_staff_name = None
+            record.updated_at = now
+            db.add(record)
+            db.add(
+                TranscriptMessageRecord(
+                    session_id=session_id,
+                    actor="assistant",
+                    message=offer_msg,
+                    used_llm=False,
+                    created_at=now,
+                )
+            )
             db.commit()
 
         return self.load_session(session_id)

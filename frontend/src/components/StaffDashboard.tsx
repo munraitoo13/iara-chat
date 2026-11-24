@@ -6,7 +6,9 @@ import {
   BarChart3,
   Bot,
   Calendar,
+  CalendarPlus,
   CheckCircle2,
+  ClipboardList,
   Clock,
   Cpu,
   ExternalLink,
@@ -15,6 +17,7 @@ import {
   Lock,
   MessageSquare,
   RefreshCw,
+  Save,
   Send,
   Sparkles,
   UserCheck,
@@ -30,20 +33,26 @@ import {
   ApiError,
   getHealth,
   listAvailableSlots,
+  staffBookAppointment,
   staffCloseSession,
+  staffExtractPatient,
   staffGetSession,
   staffListAppointments,
   staffListSessions,
+  staffOfferSlots,
   staffReleaseToAi,
   staffSendMessage,
   staffTakeoverSession,
+  staffUpdatePatient,
 } from "@/lib/api";
 import { playGentleChime } from "@/lib/sound";
 import type {
   AppointmentSlotDTO,
   BookedAppointmentDTO,
   ConversationStatus,
+  CoverageType,
   HealthResponse,
+  PatientInfo,
   SessionResponse,
   Specialty,
   StaffSessionSummary,
@@ -144,6 +153,23 @@ export function StaffDashboard() {
   const [isLoading, setIsLoading] = useState(true);
   const [isMuted, setIsMuted] = useState(false);
   const [audioBlocked, setAudioBlocked] = useState(false);
+
+  const [showDrawer, setShowDrawer] = useState(true);
+  const [drawerSessionId, setDrawerSessionId] = useState<string | null>(null);
+  const [patientDraft, setPatientDraft] = useState<PatientInfo>({
+    full_name: null,
+    date_of_birth: null,
+    address: null,
+    coverage_type: null,
+    insurance_payer: null,
+    insurance_id: null,
+    chief_complaint: null,
+    preferred_specialty: null,
+  });
+  const [copilotNotice, setCopilotNotice] = useState<string | null>(null);
+  const [drawerSlots, setDrawerSlots] = useState<AppointmentSlotDTO[]>([]);
+  const [bookSpecialty, setBookSpecialty] = useState<Specialty>("clinica_geral");
+  const [selectedSlotId, setSelectedSlotId] = useState<number | "">("");
 
   useEffect(() => {
     const savedKey = sessionStorage.getItem(STAFF_KEY_STORAGE);
@@ -265,6 +291,109 @@ export function StaffDashboard() {
     setReplyText("");
     await runStaffAction(() =>
       staffSendMessage(activeSession.session_id, staffName.trim() || "Recepção", text, staffKey),
+    );
+  };
+
+  // Sync drawer draft only when switching active session so background polling preserves edits
+  useEffect(() => {
+    if (!activeSession) {
+      setDrawerSessionId(null);
+      setCopilotNotice(null);
+      return;
+    }
+    if (activeSession.session_id !== drawerSessionId) {
+      setDrawerSessionId(activeSession.session_id);
+      setPatientDraft(activeSession.patient_info);
+      setBookSpecialty(activeSession.patient_info.preferred_specialty || "clinica_geral");
+      setCopilotNotice(null);
+    }
+  }, [activeSession, drawerSessionId]);
+
+  // Load available slots for the drawer's selected specialty
+  useEffect(() => {
+    if (!showDrawer || !activeSession || activeSession.booked_appointment) return;
+    let cancelled = false;
+    void listAvailableSlots(bookSpecialty)
+      .then((rows) => {
+        if (cancelled) return;
+        setDrawerSlots(rows);
+        setSelectedSlotId((prev) =>
+          rows.some((r) => r.slot_id === prev) ? prev : (rows[0]?.slot_id ?? ""),
+        );
+      })
+      .catch(() => {
+        if (!cancelled) setDrawerSlots([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [showDrawer, activeSession, bookSpecialty]);
+
+  const handleExtractWithCopilot = async () => {
+    if (!activeSession || actionBusy) return;
+    setActionBusy(true);
+    setActionError(null);
+    setCopilotNotice(null);
+    try {
+      const res = await staffExtractPatient(activeSession.session_id, staffKey);
+      setPatientDraft(res.extracted_patient);
+      setBookSpecialty(res.suggested_specialty);
+      const warnSuffix = res.warnings.length > 0 ? ` (${res.warnings.join(" ")})` : "";
+      setCopilotNotice(`Sugestão preenchida pela Iara — revise e salve.${warnSuffix}`);
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : "Falha ao extrair dados com IA.");
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
+  const handleSavePatientDraft = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!activeSession || actionBusy) return;
+    setCopilotNotice(null);
+    await runStaffAction(async () => {
+      const updated = await staffUpdatePatient(
+        activeSession.session_id,
+        {
+          full_name: patientDraft.full_name?.trim() || null,
+          date_of_birth: patientDraft.date_of_birth?.trim() || null,
+          address: patientDraft.address?.trim() || null,
+          coverage_type: patientDraft.coverage_type,
+          insurance_payer:
+            patientDraft.coverage_type === "convenio"
+              ? patientDraft.insurance_payer?.trim() || null
+              : null,
+          insurance_id:
+            patientDraft.coverage_type === "convenio"
+              ? patientDraft.insurance_id?.trim() || null
+              : null,
+          chief_complaint: patientDraft.chief_complaint?.trim() || null,
+          preferred_specialty: patientDraft.preferred_specialty,
+        },
+        staffKey,
+      );
+      setPatientDraft(updated.patient_info);
+      setCopilotNotice("Ficha salva com sucesso.");
+      return updated;
+    });
+  };
+
+  const handleDirectBook = async () => {
+    if (!activeSession || !selectedSlotId || actionBusy) return;
+    await runStaffAction(() =>
+      staffBookAppointment(
+        activeSession.session_id,
+        Number(selectedSlotId),
+        staffName.trim() || "Recepção",
+        staffKey,
+      ),
+    );
+  };
+
+  const handleOfferSlotsInChat = async () => {
+    if (!activeSession || actionBusy) return;
+    await runStaffAction(() =>
+      staffOfferSlots(activeSession.session_id, bookSpecialty, staffKey),
     );
   };
 
@@ -679,6 +808,19 @@ export function StaffDashboard() {
                   </div>
 
                   <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setShowDrawer((prev) => !prev)}
+                      className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-2 text-xs font-semibold transition-colors ${
+                        showDrawer
+                          ? "border-[var(--primary)] bg-[var(--primary-soft)] text-[var(--primary)]"
+                          : "border-[var(--border)] bg-[var(--surface)] text-[var(--text)] hover:bg-[var(--surface-muted)]"
+                      }`}
+                    >
+                      <ClipboardList className="h-3.5 w-3.5" />
+                      Ficha & Agenda
+                    </button>
+
                     {canTakeover && (
                       <button
                         type="button"
@@ -733,88 +875,371 @@ export function StaffDashboard() {
                   </div>
                 </div>
 
-                {/* Messages with technical badges visible for staff */}
-                <div className="soft-scroll flex-1 space-y-3 overflow-y-auto px-5 py-4">
-                  {activeSession.messages.map((m, idx) => (
-                    <div
-                      key={`${m.id ?? "msg"}-${idx}`}
-                      className={`flex flex-col gap-1 ${
-                        m.actor === "user"
-                          ? "items-start"
-                          : m.actor === "system"
-                            ? "items-center"
-                            : "items-end"
-                      }`}
-                    >
-                      {m.actor === "system" ? (
-                        <span className="rounded-full bg-[var(--surface-muted)] px-3 py-1 text-[11px] font-medium text-[var(--muted)]">
-                          {m.message}
-                        </span>
-                      ) : (
-                        <>
-                          <div
-                            className={`max-w-[80%] whitespace-pre-wrap rounded-2xl px-4 py-2.5 text-sm ${
-                              m.actor === "user"
-                                ? "border border-[var(--border)] bg-[var(--surface-muted)] text-[var(--text)]"
-                                : m.actor === "human_agent"
-                                  ? "bg-emerald-700 text-white"
-                                  : "bg-[var(--primary)] text-white"
-                            }`}
-                          >
-                            {m.message}
-                          </div>
-                          <div className="flex items-center gap-2 text-[11px] text-[var(--muted)]">
-                            <span>
-                              {m.actor === "user"
-                                ? "Paciente"
-                                : m.actor === "human_agent"
-                                  ? "Atendente humano"
-                                  : "Iara IA"}
+                {/* Chat + Collapsible Ficha & Assisted Scheduling Drawer */}
+                <div className="flex min-h-0 flex-1 overflow-hidden">
+                  <div className="flex min-w-0 flex-1 flex-col">
+                    <div className="soft-scroll flex-1 space-y-3 overflow-y-auto px-5 py-4">
+                      {activeSession.messages.map((m, idx) => (
+                        <div
+                          key={`${m.id ?? "msg"}-${idx}`}
+                          className={`flex flex-col gap-1 ${
+                            m.actor === "user"
+                              ? "items-start"
+                              : m.actor === "system"
+                                ? "items-center"
+                                : "items-end"
+                          }`}
+                        >
+                          {m.actor === "system" ? (
+                            <span className="rounded-full bg-[var(--surface-muted)] px-3 py-1 text-[11px] font-medium text-[var(--muted)]">
+                              {m.message}
                             </span>
-                            {m.actor === "assistant" && idx > 0 && (
-                              <span
-                                className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${
-                                  m.used_llm
-                                    ? "bg-indigo-50 text-indigo-700"
-                                    : "bg-emerald-50 text-emerald-700"
+                          ) : (
+                            <>
+                              <div
+                                className={`max-w-[80%] whitespace-pre-wrap rounded-2xl px-4 py-2.5 text-sm ${
+                                  m.actor === "user"
+                                    ? "border border-[var(--border)] bg-[var(--surface-muted)] text-[var(--text)]"
+                                    : m.actor === "human_agent"
+                                      ? "bg-emerald-700 text-white"
+                                      : "bg-[var(--primary)] text-white"
                                 }`}
                               >
-                                {m.used_llm ? "1 chamada · LLM" : "0 tokens · fast-path"}
-                              </span>
-                            )}
-                          </div>
-                        </>
+                                {m.message}
+                              </div>
+                              <div className="flex items-center gap-2 text-[11px] text-[var(--muted)]">
+                                <span>
+                                  {m.actor === "user"
+                                    ? "Paciente"
+                                    : m.actor === "human_agent"
+                                      ? "Atendente humano"
+                                      : "Iara IA"}
+                                </span>
+                                {m.actor === "assistant" && idx > 0 && (
+                                  <span
+                                    className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${
+                                      m.used_llm
+                                        ? "bg-indigo-50 text-indigo-700"
+                                        : "bg-emerald-50 text-emerald-700"
+                                    }`}
+                                  >
+                                    {m.used_llm ? "1 chamada · LLM" : "0 tokens · fast-path"}
+                                  </span>
+                                )}
+                              </div>
+                            </>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* Human reply bar when in takeover mode */}
+                    <div className="border-t border-[var(--border)] bg-[var(--surface)] px-4 py-3">
+                      {activeSession.status === "human_takeover" ? (
+                        <form onSubmit={(e) => void handleSendStaffReply(e)} className="flex gap-2">
+                          <input
+                            type="text"
+                            value={replyText}
+                            onChange={(e) => setReplyText(e.target.value)}
+                            placeholder={`Responder como ${staffName || "Recepção"}...`}
+                            className="flex-1 rounded-xl border border-[var(--border)] bg-[var(--bg)] px-3.5 py-2.5 text-sm focus:border-[var(--primary)] focus:outline-none"
+                          />
+                          <button
+                            type="submit"
+                            disabled={!replyText.trim() || actionBusy}
+                            className="inline-flex items-center gap-1.5 rounded-xl bg-emerald-700 px-4 py-2.5 text-xs font-semibold text-white transition-colors hover:bg-emerald-800 disabled:opacity-45"
+                          >
+                            <Send className="h-3.5 w-3.5" />
+                            Enviar
+                          </button>
+                        </form>
+                      ) : (
+                        <p className="text-center text-xs text-[var(--muted)]">
+                          {activeSession.is_finished
+                            ? "Sessão finalizada."
+                            : "Clique em 'Assumir atendimento' acima para responder diretamente ao paciente."}
+                        </p>
                       )}
                     </div>
-                  ))}
-                </div>
+                  </div>
 
-                {/* Human reply bar when in takeover mode */}
-                <div className="border-t border-[var(--border)] bg-[var(--surface)] px-4 py-3">
-                  {activeSession.status === "human_takeover" ? (
-                    <form onSubmit={(e) => void handleSendStaffReply(e)} className="flex gap-2">
-                      <input
-                        type="text"
-                        value={replyText}
-                        onChange={(e) => setReplyText(e.target.value)}
-                        placeholder={`Responder como ${staffName || "Recepção"}...`}
-                        className="flex-1 rounded-xl border border-[var(--border)] bg-[var(--bg)] px-3.5 py-2.5 text-sm focus:border-[var(--primary)] focus:outline-none"
-                      />
-                      <button
-                        type="submit"
-                        disabled={!replyText.trim() || actionBusy}
-                        className="inline-flex items-center gap-1.5 rounded-xl bg-emerald-700 px-4 py-2.5 text-xs font-semibold text-white transition-colors hover:bg-emerald-800 disabled:opacity-45"
-                      >
-                        <Send className="h-3.5 w-3.5" />
-                        Enviar
-                      </button>
-                    </form>
-                  ) : (
-                    <p className="text-center text-xs text-[var(--muted)]">
-                      {activeSession.is_finished
-                        ? "Sessão finalizada."
-                        : "Clique em 'Assumir atendimento' acima para responder diretamente ao paciente."}
-                    </p>
+                  {showDrawer && (
+                    <aside className="soft-scroll w-80 shrink-0 overflow-y-auto border-l border-[var(--border)] bg-[var(--bg)]/70 p-4">
+                      <div className="mb-3 flex items-center justify-between gap-2">
+                        <h3 className="text-xs font-semibold uppercase tracking-wide text-[var(--muted)]">
+                          Ficha do Paciente
+                        </h3>
+                        {!activeSession.is_finished && (
+                          <button
+                            type="button"
+                            disabled={actionBusy}
+                            onClick={() => void handleExtractWithCopilot()}
+                            className="inline-flex items-center gap-1 rounded-xl bg-[var(--primary-soft)] px-2.5 py-1.5 text-[11px] font-semibold text-[var(--primary)] transition-colors hover:bg-[var(--primary)] hover:text-white disabled:opacity-50"
+                          >
+                            <Sparkles className="h-3 w-3" />
+                            Preencher com IA
+                          </button>
+                        )}
+                      </div>
+
+                      {copilotNotice && (
+                        <div className="animate-fade-scale mb-3 rounded-xl border border-teal-200 bg-teal-50 px-3 py-2 text-[11px] font-medium text-teal-800">
+                          {copilotNotice}
+                        </div>
+                      )}
+
+                      <form onSubmit={(e) => void handleSavePatientDraft(e)} className="space-y-2.5">
+                        <div>
+                          <label className="mb-1 block text-[11px] font-medium text-[var(--muted)]">
+                            Nome completo
+                          </label>
+                          <input
+                            type="text"
+                            value={patientDraft.full_name ?? ""}
+                            onChange={(e) =>
+                              setPatientDraft((p) => ({ ...p, full_name: e.target.value || null }))
+                            }
+                            disabled={activeSession.is_finished}
+                            className="w-full rounded-xl border border-[var(--border)] bg-[var(--surface)] px-2.5 py-1.5 text-xs focus:border-[var(--primary)] focus:outline-none disabled:opacity-60"
+                          />
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-2">
+                          <div>
+                            <label className="mb-1 block text-[11px] font-medium text-[var(--muted)]">
+                              Nascimento
+                            </label>
+                            <input
+                              type="date"
+                              value={patientDraft.date_of_birth ?? ""}
+                              onChange={(e) =>
+                                setPatientDraft((p) => ({
+                                  ...p,
+                                  date_of_birth: e.target.value || null,
+                                }))
+                              }
+                              disabled={activeSession.is_finished}
+                              className="w-full rounded-xl border border-[var(--border)] bg-[var(--surface)] px-2 py-1.5 text-xs focus:border-[var(--primary)] focus:outline-none disabled:opacity-60"
+                            />
+                          </div>
+
+                          <div>
+                            <label className="mb-1 block text-[11px] font-medium text-[var(--muted)]">
+                              Atendimento
+                            </label>
+                            <select
+                              value={patientDraft.coverage_type ?? ""}
+                              onChange={(e) =>
+                                setPatientDraft((p) => ({
+                                  ...p,
+                                  coverage_type: (e.target.value || null) as CoverageType | null,
+                                }))
+                              }
+                              disabled={activeSession.is_finished}
+                              className="w-full rounded-xl border border-[var(--border)] bg-[var(--surface)] px-2 py-1.5 text-xs focus:border-[var(--primary)] focus:outline-none disabled:opacity-60"
+                            >
+                              <option value="">Pendente</option>
+                              <option value="particular">Particular</option>
+                              <option value="convenio">Convênio</option>
+                            </select>
+                          </div>
+                        </div>
+
+                        {patientDraft.coverage_type === "convenio" && (
+                          <div className="grid grid-cols-2 gap-2">
+                            <div>
+                              <label className="mb-1 block text-[11px] font-medium text-[var(--muted)]">
+                                Operadora
+                              </label>
+                              <input
+                                type="text"
+                                value={patientDraft.insurance_payer ?? ""}
+                                onChange={(e) =>
+                                  setPatientDraft((p) => ({
+                                    ...p,
+                                    insurance_payer: e.target.value || null,
+                                  }))
+                                }
+                                disabled={activeSession.is_finished}
+                                className="w-full rounded-xl border border-[var(--border)] bg-[var(--surface)] px-2.5 py-1.5 text-xs focus:border-[var(--primary)] focus:outline-none disabled:opacity-60"
+                              />
+                            </div>
+                            <div>
+                              <label className="mb-1 block text-[11px] font-medium text-[var(--muted)]">
+                                Carteirinha
+                              </label>
+                              <input
+                                type="text"
+                                value={patientDraft.insurance_id ?? ""}
+                                onChange={(e) =>
+                                  setPatientDraft((p) => ({
+                                    ...p,
+                                    insurance_id: e.target.value || null,
+                                  }))
+                                }
+                                disabled={activeSession.is_finished}
+                                className="w-full rounded-xl border border-[var(--border)] bg-[var(--surface)] px-2.5 py-1.5 text-xs focus:border-[var(--primary)] focus:outline-none disabled:opacity-60"
+                              />
+                            </div>
+                          </div>
+                        )}
+
+                        <div>
+                          <label className="mb-1 block text-[11px] font-medium text-[var(--muted)]">
+                            Endereço
+                          </label>
+                          <input
+                            type="text"
+                            value={patientDraft.address ?? ""}
+                            onChange={(e) =>
+                              setPatientDraft((p) => ({ ...p, address: e.target.value || null }))
+                            }
+                            disabled={activeSession.is_finished}
+                            className="w-full rounded-xl border border-[var(--border)] bg-[var(--surface)] px-2.5 py-1.5 text-xs focus:border-[var(--primary)] focus:outline-none disabled:opacity-60"
+                          />
+                        </div>
+
+                        <div>
+                          <label className="mb-1 block text-[11px] font-medium text-[var(--muted)]">
+                            Queixa principal
+                          </label>
+                          <textarea
+                            rows={2}
+                            value={patientDraft.chief_complaint ?? ""}
+                            onChange={(e) =>
+                              setPatientDraft((p) => ({
+                                ...p,
+                                chief_complaint: e.target.value || null,
+                              }))
+                            }
+                            disabled={activeSession.is_finished}
+                            className="w-full rounded-xl border border-[var(--border)] bg-[var(--surface)] px-2.5 py-1.5 text-xs focus:border-[var(--primary)] focus:outline-none disabled:opacity-60"
+                          />
+                        </div>
+
+                        <div>
+                          <label className="mb-1 block text-[11px] font-medium text-[var(--muted)]">
+                            Especialidade sugerida
+                          </label>
+                          <select
+                            value={patientDraft.preferred_specialty ?? ""}
+                            onChange={(e) => {
+                              const nextSpec = (e.target.value || null) as Specialty | null;
+                              setPatientDraft((p) => ({ ...p, preferred_specialty: nextSpec }));
+                              if (nextSpec) setBookSpecialty(nextSpec);
+                            }}
+                            disabled={activeSession.is_finished}
+                            className="w-full rounded-xl border border-[var(--border)] bg-[var(--surface)] px-2 py-1.5 text-xs focus:border-[var(--primary)] focus:outline-none disabled:opacity-60"
+                          >
+                            <option value="">Não definida</option>
+                            <option value="clinica_geral">Clínica Geral</option>
+                            <option value="ortopedia">Ortopedia</option>
+                            <option value="dermatologia">Dermatologia</option>
+                            <option value="cardiologia">Cardiologia</option>
+                          </select>
+                        </div>
+
+                        {!activeSession.is_finished && (
+                          <button
+                            type="submit"
+                            disabled={actionBusy}
+                            className="inline-flex w-full items-center justify-center gap-1.5 rounded-xl border border-[var(--border)] bg-[var(--surface)] py-2 text-xs font-semibold text-[var(--text)] transition-colors hover:bg-[var(--surface-muted)] disabled:opacity-50"
+                          >
+                            <Save className="h-3.5 w-3.5 text-[var(--primary)]" />
+                            Salvar ficha
+                          </button>
+                        )}
+                      </form>
+
+                      <div className="my-4 h-px bg-[var(--border)]" />
+
+                      <h3 className="mb-2.5 text-xs font-semibold uppercase tracking-wide text-[var(--muted)]">
+                        Agendamento Assistido
+                      </h3>
+
+                      {activeSession.booked_appointment ? (
+                        <div className="rounded-2xl border border-emerald-200 bg-emerald-50/70 p-3 text-xs text-emerald-950">
+                          <p className="font-semibold text-emerald-900">
+                            Confirmado · #
+                            {activeSession.booked_appointment.appointment_id
+                              .slice(0, 8)
+                              .toUpperCase()}
+                          </p>
+                          <p className="mt-1">
+                            {activeSession.booked_appointment.specialty_label} ·{" "}
+                            {activeSession.booked_appointment.doctor_name}
+                          </p>
+                          <p className="mt-0.5 text-emerald-800">
+                            {formatDateTimeBr(activeSession.booked_appointment.starts_at)}
+                          </p>
+                        </div>
+                      ) : activeSession.is_finished ? (
+                        <p className="text-xs text-[var(--muted)]">
+                          Sessão encerrada sem agendamento.
+                        </p>
+                      ) : (
+                        <div className="space-y-2.5">
+                          <div>
+                            <label className="mb-1 block text-[11px] font-medium text-[var(--muted)]">
+                              Filtrar especialidade
+                            </label>
+                            <select
+                              value={bookSpecialty}
+                              onChange={(e) => setBookSpecialty(e.target.value as Specialty)}
+                              className="w-full rounded-xl border border-[var(--border)] bg-[var(--surface)] px-2 py-1.5 text-xs focus:border-[var(--primary)] focus:outline-none"
+                            >
+                              <option value="clinica_geral">Clínica Geral</option>
+                              <option value="ortopedia">Ortopedia</option>
+                              <option value="dermatologia">Dermatologia</option>
+                              <option value="cardiologia">Cardiologia</option>
+                            </select>
+                          </div>
+
+                          <div>
+                            <label className="mb-1 block text-[11px] font-medium text-[var(--muted)]">
+                              Horário disponível
+                            </label>
+                            <select
+                              value={selectedSlotId}
+                              onChange={(e) =>
+                                setSelectedSlotId(e.target.value ? Number(e.target.value) : "")
+                              }
+                              className="w-full rounded-xl border border-[var(--border)] bg-[var(--surface)] px-2 py-1.5 text-xs focus:border-[var(--primary)] focus:outline-none"
+                            >
+                              {drawerSlots.length === 0 ? (
+                                <option value="">Sem horários livres</option>
+                              ) : (
+                                drawerSlots.map((slot) => (
+                                  <option key={slot.slot_id} value={slot.slot_id}>
+                                    {slot.display_label}
+                                  </option>
+                                ))
+                              )}
+                            </select>
+                          </div>
+
+                          <button
+                            type="button"
+                            disabled={!selectedSlotId || actionBusy}
+                            onClick={() => void handleDirectBook()}
+                            className="inline-flex w-full items-center justify-center gap-1.5 rounded-xl bg-[var(--primary)] py-2 text-xs font-semibold text-white transition-colors hover:bg-[var(--primary-hover)] disabled:opacity-45"
+                          >
+                            <CalendarPlus className="h-3.5 w-3.5" />
+                            Agendar horário
+                          </button>
+
+                          <button
+                            type="button"
+                            disabled={drawerSlots.length === 0 || actionBusy}
+                            onClick={() => void handleOfferSlotsInChat()}
+                            className="inline-flex w-full items-center justify-center gap-1.5 rounded-xl bg-[var(--primary-soft)] py-2 text-xs font-semibold text-[var(--primary)] transition-colors hover:bg-[var(--primary)] hover:text-white disabled:opacity-45"
+                          >
+                            <Send className="h-3.5 w-3.5" />
+                            Enviar horários no chat
+                          </button>
+                        </div>
+                      )}
+                    </aside>
                   )}
                 </div>
               </>

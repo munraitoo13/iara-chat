@@ -1,11 +1,11 @@
 """Pydantic request/response schemas for the versioned FastAPI layer."""
 
-from datetime import datetime
+from datetime import date, datetime
 
 from pydantic import BaseModel, Field
 
 from iara.conversation.state import AgentReply, ConversationStatus
-from iara.models.patient import PatientInfo
+from iara.models.patient import CoverageType, PatientInfo
 from iara.models.scheduling import AppointmentSlotDTO, BookedAppointmentDTO, Specialty
 
 
@@ -103,6 +103,40 @@ class StaffCloseRequest(BaseModel):
     """Optional closing note when staff marks a session completed."""
 
     closing_note: str | None = Field(default=None, max_length=1000)
+
+
+class StaffUpdatePatientRequest(BaseModel):
+    """Partial or full patient record update submitted by staff."""
+
+    full_name: str | None = None
+    date_of_birth: date | None = None
+    address: str | None = None
+    coverage_type: CoverageType | None = None
+    insurance_payer: str | None = None
+    insurance_id: str | None = None
+    chief_complaint: str | None = None
+    preferred_specialty: Specialty | None = None
+
+
+class StaffBookAppointmentRequest(BaseModel):
+    """Direct appointment booking triggered by staff on behalf of the patient."""
+
+    slot_id: int = Field(ge=1)
+    staff_name: str = Field(default="Recepção", min_length=2, max_length=100)
+
+
+class StaffOfferSlotsRequest(BaseModel):
+    """Optional specialty override when staff sends slot chips into the patient chat."""
+
+    specialty: Specialty | None = None
+
+
+class StaffExtractResponse(BaseModel):
+    """On-demand silent AI Copilot extraction returned for staff review."""
+
+    extracted_patient: PatientInfo
+    suggested_specialty: Specialty
+    warnings: list[str] = Field(default_factory=list)
 
 
 def build_quick_replies(

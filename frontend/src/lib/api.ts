@@ -5,7 +5,9 @@ import type {
   HealthResponse,
   SessionResponse,
   Specialty,
+  StaffExtractResponse,
   StaffSessionSummary,
+  StaffUpdatePatientRequest,
   TurnResponse,
 } from "@/lib/types";
 
@@ -158,6 +160,63 @@ export function staffCloseSession(
       method: "POST",
       body: JSON.stringify({ closing_note: closingNote ?? null }),
     },
+    staffKey,
+  );
+}
+
+export function staffUpdatePatient(
+  sessionId: string,
+  payload: StaffUpdatePatientRequest,
+  staffKey: string | null,
+): Promise<SessionResponse> {
+  return requestJson<SessionResponse>(
+    `/staff/sessions/${sessionId}/patient`,
+    {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    },
+    staffKey,
+  );
+}
+
+export function staffBookAppointment(
+  sessionId: string,
+  slotId: number,
+  staffName: string,
+  staffKey: string | null,
+): Promise<SessionResponse> {
+  return requestJson<SessionResponse>(
+    `/staff/sessions/${sessionId}/book`,
+    {
+      method: "POST",
+      body: JSON.stringify({ slot_id: slotId, staff_name: staffName }),
+    },
+    staffKey,
+  );
+}
+
+export function staffOfferSlots(
+  sessionId: string,
+  specialty: Specialty | null,
+  staffKey: string | null,
+): Promise<SessionResponse> {
+  return requestJson<SessionResponse>(
+    `/staff/sessions/${sessionId}/offer-slots`,
+    {
+      method: "POST",
+      body: JSON.stringify({ specialty }),
+    },
+    staffKey,
+  );
+}
+
+export function staffExtractPatient(
+  sessionId: string,
+  staffKey: string | null,
+): Promise<StaffExtractResponse> {
+  return requestJson<StaffExtractResponse>(
+    `/staff/sessions/${sessionId}/extract`,
+    { method: "POST" },
     staffKey,
   );
 }

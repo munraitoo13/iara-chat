@@ -19,19 +19,31 @@ from iara.api.schemas import (
     HealthResponse,
     MessageDTO,
     SessionResponse,
+    StaffBookAppointmentRequest,
     StaffCloseRequest,
+    StaffExtractResponse,
     StaffMessageRequest,
+    StaffOfferSlotsRequest,
     StaffSessionSummary,
     StaffTakeoverRequest,
+    StaffUpdatePatientRequest,
     TurnResponse,
     build_quick_replies,
 )
 from iara.config import Settings, get_settings
 from iara.conversation.engine import IntakeAgent
+from iara.conversation.guardrails import validate_and_normalize_fields
+from iara.conversation.prompts import COPILOT_EXTRACTION_SYSTEM_PROMPT, build_analysis_payload
 from iara.conversation.state import ConversationStatus
 from iara.db.repository import LoadedSession, SessionRepository, create_db_engine
-from iara.models.scheduling import AppointmentSlotDTO, BookedAppointmentDTO, Specialty
-from iara.services.llm import LLMClient, create_llm_client
+from iara.models.patient import CoverageType
+from iara.models.scheduling import (
+    AppointmentSlotDTO,
+    BookedAppointmentDTO,
+    Specialty,
+    suggest_specialty_from_complaint,
+)
+from iara.services.llm import LLMClient, LLMError, create_llm_client
 
 _WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 
@@ -362,6 +374,138 @@ def create_app(
                 detail="Sessão de atendimento não encontrada.",
             )
         return _build_session_response(loaded, active_repo)
+
+    @app.patch(
+        "/api/v1/staff/sessions/{session_id}/patient",
+        response_model=SessionResponse,
+        dependencies=[Depends(require_staff_key)],
+        tags=["staff"],
+    )
+    def staff_update_patient(
+        session_id: str,
+        payload: StaffUpdatePatientRequest,
+    ) -> SessionResponse:
+        try:
+            loaded = active_repo.staff_update_patient(
+                session_id,
+                payload.model_dump(exclude_unset=True),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from None
+        if loaded is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Sessão de atendimento não encontrada.",
+            )
+        return _build_session_response(loaded, active_repo)
+
+    @app.post(
+        "/api/v1/staff/sessions/{session_id}/book",
+        response_model=SessionResponse,
+        dependencies=[Depends(require_staff_key)],
+        tags=["staff"],
+    )
+    def staff_book_appointment(
+        session_id: str,
+        payload: StaffBookAppointmentRequest,
+    ) -> SessionResponse:
+        try:
+            loaded = active_repo.staff_book_appointment(
+                session_id,
+                payload.slot_id,
+                payload.staff_name,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from None
+        if loaded is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Sessão de atendimento não encontrada.",
+            )
+        return _build_session_response(loaded, active_repo)
+
+    @app.post(
+        "/api/v1/staff/sessions/{session_id}/offer-slots",
+        response_model=SessionResponse,
+        dependencies=[Depends(require_staff_key)],
+        tags=["staff"],
+    )
+    def staff_offer_slots(
+        session_id: str,
+        payload: StaffOfferSlotsRequest | None = None,
+    ) -> SessionResponse:
+        specialty = payload.specialty if payload else None
+        try:
+            loaded = active_repo.staff_offer_slots_in_chat(session_id, specialty=specialty)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from None
+        if loaded is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Sessão de atendimento não encontrada.",
+            )
+        return _build_session_response(loaded, active_repo)
+
+    @app.post(
+        "/api/v1/staff/sessions/{session_id}/extract",
+        response_model=StaffExtractResponse,
+        dependencies=[Depends(require_staff_key)],
+        tags=["staff"],
+    )
+    def staff_extract_patient(session_id: str) -> StaffExtractResponse:
+        loaded = active_repo.load_session(session_id)
+        if loaded is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Sessão de atendimento não encontrada.",
+            )
+
+        recent = [
+            {"actor": item.actor, "message": item.message} for item in loaded.state.transcript[-16:]
+        ]
+        payload = build_analysis_payload(
+            status=loaded.state.status,
+            patient_info=loaded.state.patient_info,
+            recent_messages=recent,
+            user_input="Extrair e consolidar dados do paciente da conversa recente.",
+        )
+
+        try:
+            analysis = active_llm.analyze_turn(COPILOT_EXTRACTION_SYSTEM_PROMPT, payload)
+        except LLMError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"Falha ao extrair ficha com IA: {exc}",
+            ) from None
+
+        updates, warnings = validate_and_normalize_fields(analysis.extracted)
+        candidate = loaded.state.patient_info.model_copy(deep=True)
+        for field_name, value in updates.items():
+            setattr(candidate, field_name, value)
+
+        if candidate.coverage_type == CoverageType.PRIVATE:
+            candidate.insurance_payer = None
+            candidate.insurance_id = None
+        elif (
+            "insurance_payer" in updates or "insurance_id" in updates
+        ) and candidate.coverage_type is None:
+            candidate.coverage_type = CoverageType.INSURANCE
+
+        suggested = (
+            Specialty(analysis.requested_specialty)
+            if analysis.requested_specialty
+            else (
+                candidate.preferred_specialty
+                or suggest_specialty_from_complaint(candidate.chief_complaint)
+            )
+        )
+        candidate.preferred_specialty = suggested
+
+        return StaffExtractResponse(
+            extracted_patient=candidate,
+            suggested_specialty=suggested,
+            warnings=warnings,
+        )
 
     if _WEB_DIR.is_dir():
         app.mount("/static", StaticFiles(directory=_WEB_DIR), name="static")
