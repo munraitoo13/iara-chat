@@ -7,6 +7,7 @@ from typing import Literal
 
 from iara.models.extraction import ExtractedPatientFields
 from iara.models.patient import CoverageType
+from iara.models.scheduling import AppointmentSlotDTO, Specialty
 
 EMERGENCY_RESPONSE_PTBR = (
     "Atenção: os sintomas informados podem indicar uma emergência médica ou situação de risco.\n"
@@ -79,7 +80,30 @@ _INSURANCE_FAST_PATH = frozenset(
     }
 )
 
+_SPECIALTY_CHOICES: dict[str, Specialty] = {
+    "clinica geral": Specialty.GENERAL_PRACTICE,
+    "clinico geral": Specialty.GENERAL_PRACTICE,
+    "ortopedia": Specialty.ORTHOPEDICS,
+    "ortopedista": Specialty.ORTHOPEDICS,
+    "dermatologia": Specialty.DERMATOLOGY,
+    "dermatologista": Specialty.DERMATOLOGY,
+    "cardiologia": Specialty.CARDIOLOGY,
+    "cardiologista": Specialty.CARDIOLOGY,
+}
+
 _BR_DATE_RE = re.compile(r"^(\d{2})[/-](\d{2})[/-](\d{4})$")
+_SLOT_ID_RE = re.compile(r"^slot:(\d+)$")
+_SLOT_INDEX_RE = re.compile(r"^(?:opcao|horario|numero|#)?\s*(\d+)$")
+
+_HANDOFF_PATTERNS = (
+    re.compile(
+        r"\b(falar|conversar|passar|transferir|atender)\s+(com|para)\s+"
+        r"(um|uma|o|a)?\s*(humano|atendente|pessoa|recepcionista|recepcao|secretaria)\b"
+    ),
+    re.compile(r"\bquero\s+(um|uma)?\s*(humano|atendente|pessoa|recepcionista)\b"),
+    re.compile(r"\batendimento\s+humano\b"),
+    re.compile(r"\bchamar\s+(um|uma)?\s*(atendente|humano|recepcionista)\b"),
+)
 
 _RED_FLAG_PATTERNS = (
     re.compile(r"\bdor\s+(muito\s+|bem\s+|super\s+)?(forte\s+)?no\s+peito\b"),
@@ -132,6 +156,13 @@ def detect_red_flag_keywords(text: str) -> bool:
     return any(pattern.search(normalized) for pattern in _RED_FLAG_PATTERNS)
 
 
+def detect_human_handoff_request(text: str) -> bool:
+    """Detect explicit requests for human reception/attendant transfer without LLM calls."""
+
+    normalized = _strip_accents(text)
+    return any(pattern.search(normalized) for pattern in _HANDOFF_PATTERNS)
+
+
 def match_confirmation_fast_path(text: str) -> Literal["confirm", "edit"] | None:
     """Match unambiguous confirmation/rejection replies with zero LLM tokens."""
 
@@ -140,6 +171,38 @@ def match_confirmation_fast_path(text: str) -> Literal["confirm", "edit"] | None
         return "confirm"
     if choice in _EDIT_FAST_PATH:
         return "edit"
+    return None
+
+
+def match_specialty_choice(text: str) -> Specialty | None:
+    """Match explicit medical specialty requests deterministically."""
+
+    return _SPECIALTY_CHOICES.get(_normalize_choice(text))
+
+
+def match_slot_selection(
+    text: str,
+    available_slots: list[AppointmentSlotDTO],
+) -> AppointmentSlotDTO | None:
+    """Match quick-reply `slot:<id>` or 1-based option index against available slots."""
+
+    if not available_slots:
+        return None
+
+    normalized = _normalize_choice(text)
+    id_match = _SLOT_ID_RE.fullmatch(normalized)
+    if id_match:
+        target_id = int(id_match.group(1))
+        for slot in available_slots:
+            if slot.slot_id == target_id:
+                return slot
+        return None
+
+    idx_match = _SLOT_INDEX_RE.fullmatch(normalized)
+    if idx_match:
+        index = int(idx_match.group(1))
+        if 1 <= index <= len(available_slots):
+            return available_slots[index - 1]
     return None
 
 

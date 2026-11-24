@@ -61,6 +61,22 @@ class TurnAnalysis(BaseModel):
             "that the user explicitly wants to change or clear."
         ),
     )
+    requested_specialty: (
+        Literal["clinica_geral", "ortopedia", "dermatologia", "cardiologia"] | None
+    ) = Field(
+        default=None,
+        description=(
+            "Medical specialty explicitly requested by the user during scheduling "
+            "('clinica_geral', 'ortopedia', 'dermatologia', or 'cardiologia')."
+        ),
+    )
+    human_handoff_requested: bool = Field(
+        default=False,
+        description=(
+            "True if the user asks to speak with a human receptionist/attendant "
+            "or expresses frustration wanting human help."
+        ),
+    )
     clinical_red_flag: bool = Field(
         default=False,
         description=(

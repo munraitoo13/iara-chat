@@ -7,6 +7,10 @@ from iara.api.schemas import (
     MessageDTO,
     QuickReplyOption,
     SessionResponse,
+    StaffCloseRequest,
+    StaffMessageRequest,
+    StaffSessionSummary,
+    StaffTakeoverRequest,
     TurnResponse,
 )
 
@@ -16,6 +20,10 @@ __all__ = [
     "MessageDTO",
     "QuickReplyOption",
     "SessionResponse",
+    "StaffCloseRequest",
+    "StaffMessageRequest",
+    "StaffSessionSummary",
+    "StaffTakeoverRequest",
     "TurnResponse",
     "create_app",
     "run",

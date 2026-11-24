@@ -32,6 +32,9 @@ const els = {
 const STATUS_META = {
   collecting: { label: "Em coleta", className: "status-pill status-collecting" },
   confirming: { label: "Aguardando confirmação", className: "status-pill status-confirming" },
+  scheduling: { label: "Agendamento", className: "status-pill status-confirming" },
+  waiting_human: { label: "Aguardando atendente", className: "status-pill status-confirming" },
+  human_takeover: { label: "Atendimento humano", className: "status-pill status-collecting" },
   completed: { label: "Concluído", className: "status-pill status-completed" },
   emergency: { label: "Emergência", className: "status-pill status-emergency" },
 };
@@ -243,16 +246,18 @@ async function sendMessage(text) {
     const { reply } = data;
     state.isFinished = reply.is_finished;
 
-    if (reply.used_llm) {
-      state.llmTurns += 1;
-    } else {
-      state.fastTurns += 1;
-    }
+    if (reply.message) {
+      if (reply.used_llm) {
+        state.llmTurns += 1;
+      } else {
+        state.fastTurns += 1;
+      }
 
-    appendMessage(reply.error ? "system" : "assistant", reply.message, {
-      usedLlm: reply.used_llm,
-      isEmergency: reply.status === "emergency",
-    });
+      appendMessage(reply.error ? "system" : "assistant", reply.message, {
+        usedLlm: reply.used_llm,
+        isEmergency: reply.status === "emergency",
+      });
+    }
     updateTelemetry();
     updateSummary(reply.status, reply.patient_info, data.missing_fields);
     renderQuickReplies(data.quick_replies);

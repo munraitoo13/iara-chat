@@ -6,6 +6,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from iara.models.scheduling import SPECIALTY_LABELS_PTBR, Specialty
+
 
 class CoverageType(StrEnum):
     """Supported payment/coverage modalities in Brazilian healthcare."""
@@ -35,6 +37,7 @@ class PatientInfo(BaseModel):
     insurance_payer: str | None = None
     insurance_id: str | None = None
     chief_complaint: str | None = None
+    preferred_specialty: Specialty | None = None
 
     def missing_fields(self) -> list[str]:
         """Return ordered keys of fields that still need to be collected."""
@@ -77,12 +80,16 @@ class PatientInfo(BaseModel):
             lines.append(f"- Operadora: {self.insurance_payer or '-'}")
             lines.append(f"- Carteirinha: {self.insurance_id or '-'}")
         lines.append(f"- Queixa principal: {self.chief_complaint or '-'}")
+        if self.preferred_specialty is not None:
+            lines.append(
+                f"- Especialidade sugerida: {SPECIALTY_LABELS_PTBR[self.preferred_specialty]}"
+            )
         return "\n".join(lines)
 
 
 class TranscriptItem(BaseModel):
     """Single message entry in a conversation transcript."""
 
-    actor: Literal["user", "assistant", "system"]
+    actor: Literal["user", "assistant", "human_agent", "system"]
     message: str
     timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))

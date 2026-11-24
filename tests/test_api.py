@@ -122,17 +122,29 @@ def test_full_api_lifecycle_persistence_quick_replies_and_lgpd_delete(tmp_path: 
             {"label": "Corrigir dados", "value": "não"},
         ]
 
-        # 6. Quick reply "sim" -> 0 tokens fast-path completes intake
+        # 6. Quick reply "sim" -> 0 tokens fast-path enters scheduling with slot quick replies
         t5 = client.post(
             f"/api/v1/sessions/{session_id}/messages",
             json={"message": "sim"},
         )
         assert t5.status_code == 200
         assert t5.json()["reply"]["used_llm"] is False
-        assert t5.json()["reply"]["status"] == "completed"
-        assert t5.json()["reply"]["is_finished"] is True
+        assert t5.json()["reply"]["status"] == "scheduling"
+        first_slot_value = t5.json()["quick_replies"][0]["value"]
+        assert first_slot_value.startswith("slot:")
 
-        # 7. Restore session using a fresh repository/app instance (restart simulation)
+        # 7. Select slot via quick reply -> 0 tokens fast-path completes booking
+        t6 = client.post(
+            f"/api/v1/sessions/{session_id}/messages",
+            json={"message": first_slot_value},
+        )
+        assert t6.status_code == 200
+        assert t6.json()["reply"]["used_llm"] is False
+        assert t6.json()["reply"]["status"] == "completed"
+        assert t6.json()["reply"]["is_finished"] is True
+        assert t6.json()["reply"]["booked_appointment"] is not None
+
+        # 8. Restore session using a fresh repository/app instance (restart simulation)
         fresh_repo = SessionRepository(create_db_engine(settings.database_url))
         fresh_app = create_app(settings=settings, llm=FakeApiLLM([]), repository=fresh_repo)
         with TestClient(fresh_app) as fresh_client:
@@ -142,9 +154,10 @@ def test_full_api_lifecycle_persistence_quick_replies_and_lgpd_delete(tmp_path: 
             assert restored["status"] == "completed"
             assert restored["patient_info"]["full_name"] == "Juliana Costa"
             assert restored["patient_info"]["coverage_type"] == "particular"
-            assert len(restored["messages"]) == 11
+            assert restored["booked_appointment"] is not None
+            assert len(restored["messages"]) == 13
 
-            # 8. LGPD delete removes session and returns 404 afterward
+            # 9. LGPD delete removes session and returns 404 afterward
             del_res = fresh_client.delete(f"/api/v1/sessions/{session_id}")
             assert del_res.status_code == 204
             assert fresh_client.get(f"/api/v1/sessions/{session_id}").status_code == 404

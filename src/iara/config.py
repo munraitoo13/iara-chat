@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     )
     api_host: str = "127.0.0.1"
     api_port: int = 8000
+    staff_api_key: SecretStr | None = None
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -66,6 +67,14 @@ class Settings(BaseSettings):
         if self.llm_provider == "vercel_gateway":
             return self.ai_gateway_model
         return self.gemini_model
+
+    def configured_staff_api_key(self) -> str | None:
+        """Return non-empty staff API key when configured, else None."""
+
+        if self.staff_api_key is None:
+            return None
+        val = self.staff_api_key.get_secret_value().strip()
+        return val or None
 
 
 def get_settings() -> Settings:
