@@ -1,8 +1,9 @@
-"""Deterministic validation rules and clinical safety guardrails."""
+"""Deterministic validation rules, fast-path matchers, and clinical safety guardrails."""
 
 import re
 import unicodedata
 from datetime import date, datetime
+from typing import Literal
 
 from iara.models.extraction import ExtractedPatientFields
 from iara.models.patient import CoverageType
@@ -34,6 +35,52 @@ _PLACEHOLDER_STRINGS = frozenset(
     }
 )
 
+_CONFIRM_FAST_PATH = frozenset(
+    {
+        "sim",
+        "s",
+        "confirmo",
+        "confirmar",
+        "tudo certo",
+        "pode confirmar",
+        "esta correto",
+        "correto",
+        "ok",
+        "certo",
+    }
+)
+
+_EDIT_FAST_PATH = frozenset(
+    {
+        "nao",
+        "n",
+        "errado",
+        "corrigir",
+        "editar",
+        "alterar",
+    }
+)
+
+_PRIVATE_FAST_PATH = frozenset(
+    {
+        "particular",
+        "sem convenio",
+        "nao tenho convenio",
+        "atendimento particular",
+    }
+)
+
+_INSURANCE_FAST_PATH = frozenset(
+    {
+        "convenio",
+        "plano",
+        "plano de saude",
+        "por convenio",
+    }
+)
+
+_BR_DATE_RE = re.compile(r"^(\d{2})[/-](\d{2})[/-](\d{4})$")
+
 _RED_FLAG_PATTERNS = (
     re.compile(r"\bdor\s+(muito\s+|bem\s+|super\s+)?(forte\s+)?no\s+peito\b"),
     re.compile(r"\bdor\s+toracica\b"),
@@ -58,6 +105,12 @@ def _collapse_spaces(value: str) -> str:
     return " ".join(value.split())
 
 
+def _normalize_choice(value: str) -> str:
+    """Normalize short user choices by stripping accents, whitespace, and trailing punctuation."""
+
+    return _collapse_spaces(_strip_accents(value)).strip(" .!?,;:")
+
+
 def validate_input_length(text: str, max_chars: int) -> str | None:
     """Return a PT-BR error message if input is empty or exceeds the character limit."""
 
@@ -77,6 +130,47 @@ def detect_red_flag_keywords(text: str) -> bool:
 
     normalized = _strip_accents(text)
     return any(pattern.search(normalized) for pattern in _RED_FLAG_PATTERNS)
+
+
+def match_confirmation_fast_path(text: str) -> Literal["confirm", "edit"] | None:
+    """Match unambiguous confirmation/rejection replies with zero LLM tokens."""
+
+    choice = _normalize_choice(text)
+    if choice in _CONFIRM_FAST_PATH:
+        return "confirm"
+    if choice in _EDIT_FAST_PATH:
+        return "edit"
+    return None
+
+
+def match_collecting_fast_path(
+    text: str,
+    next_missing_field: str,
+    today: date | None = None,
+) -> tuple[dict[str, object], list[str]] | None:
+    """Handle closed choices and exact DD/MM/YYYY dates deterministically without LLM calls."""
+
+    if next_missing_field == "coverage_type":
+        choice = _normalize_choice(text)
+        if choice in _PRIVATE_FAST_PATH:
+            return {"coverage_type": CoverageType.PRIVATE}, []
+        if choice in _INSURANCE_FAST_PATH:
+            return {"coverage_type": CoverageType.INSURANCE}, []
+        return None
+
+    if next_missing_field == "date_of_birth":
+        match = _BR_DATE_RE.fullmatch(text.strip())
+        if not match:
+            return None
+        normalized_date = f"{match.group(1)}/{match.group(2)}/{match.group(3)}"
+        parsed = _parse_birth_date(normalized_date)
+        ref_today = today or date.today()
+        min_dob = date(ref_today.year - 130, 1, 1)
+        if parsed is not None and min_dob <= parsed <= ref_today:
+            return {"date_of_birth": parsed}, []
+        return {}, ["Data de nascimento inválida. Informe uma data válida no formato DD/MM/AAAA."]
+
+    return None
 
 
 def _parse_birth_date(raw_date: str) -> date | None:

@@ -1,4 +1,4 @@
-"""Structured LLM output schemas for turn-level extraction and safety analysis."""
+"""Structured LLM output schemas for unified turn-level extraction, safety, and reply."""
 
 from typing import Literal
 
@@ -42,7 +42,7 @@ class ExtractedPatientFields(BaseModel):
 
 
 class TurnAnalysis(BaseModel):
-    """Combined structured extraction, intent, and safety signals for one user turn."""
+    """Combined structured extraction, intent, safety signals, and reply for one user turn."""
 
     extracted: ExtractedPatientFields = Field(default_factory=ExtractedPatientFields)
     confirmation_intent: Literal["confirm", "edit", "unclear", "none"] = Field(
@@ -81,5 +81,12 @@ class TurnAnalysis(BaseModel):
         description=(
             "Brief explanation in Brazilian Portuguese if the user attempted to provide a field "
             "with invalid or incomplete data (e.g., fictional date or digits-only name)."
+        ),
+    )
+    assistant_reply: str | None = Field(
+        default=None,
+        description=(
+            "Short, warm Brazilian Portuguese reply (1-2 sentences) acknowledging extracted info "
+            "and asking for the next remaining missing field, or null when confirming/complete."
         ),
     )

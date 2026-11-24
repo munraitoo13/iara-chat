@@ -1,4 +1,4 @@
-"""Behavioral tests for IntakeAgent, lazy config, and error resilience."""
+"""Behavioral tests for hybrid IntakeAgent, lazy provider settings, and error resilience."""
 
 import pytest
 from pydantic import ValidationError
@@ -8,21 +8,15 @@ from iara.conversation.engine import IntakeAgent
 from iara.conversation.state import ConversationStatus
 from iara.models.extraction import ExtractedPatientFields, TurnAnalysis
 from iara.models.patient import CoverageType
-from iara.services.llm import LLMError
+from iara.services.llm import GeminiClient, LLMError, VercelGatewayClient, create_llm_client
 
 
 class FakeLLM:
-    """Deterministic test double implementing LLMClient without network calls."""
+    """Deterministic test double implementing the single-call LLMClient protocol."""
 
-    def __init__(
-        self,
-        analyses: list[TurnAnalysis | Exception],
-        replies: list[str | Exception] | None = None,
-    ) -> None:
+    def __init__(self, analyses: list[TurnAnalysis | Exception]) -> None:
         self._analyses = list(analyses)
-        self._replies = list(replies or [])
         self.analysis_payloads: list[str] = []
-        self.reply_payloads: list[str] = []
 
     def analyze_turn(self, system_instruction: str, user_payload: str) -> TurnAnalysis:
         self.analysis_payloads.append(user_payload)
@@ -31,47 +25,52 @@ class FakeLLM:
             raise item
         return item
 
-    def generate_reply(self, system_instruction: str, prompt: str) -> str:
-        self.reply_payloads.append(prompt)
-        if not self._replies:
-            return "Certo! Qual é a próxima informação?"
-        item = self._replies.pop(0)
-        if isinstance(item, Exception):
-            raise item
-        return item
 
-
-def test_lazy_settings_does_not_fail_on_import_and_reads_env(
+def test_lazy_settings_validates_vercel_gateway_and_gemini_providers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.delenv("AI_GATEWAY_API_KEY", raising=False)
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.setenv("LLM_PROVIDER", "vercel_gateway")
     with pytest.raises(ValidationError):
         get_settings()
 
-    monkeypatch.setenv("GEMINI_API_KEY", "test-secret-key")
-    monkeypatch.setenv("GEMINI_MODEL", "gemini-3.8-flash")
-    settings = get_settings()
-    assert settings.gemini_api_key.get_secret_value() == "test-secret-key"
-    assert settings.gemini_model == "gemini-3.8-flash"
+    monkeypatch.setenv("AI_GATEWAY_API_KEY", "gw-secret")
+    monkeypatch.setenv("AI_GATEWAY_FALLBACK_MODELS", "openai/gpt-4.1-nano, google/gemini-3.8-flash")
+    gw_settings = get_settings()
+    assert gw_settings.parsed_fallback_models() == [
+        "openai/gpt-4.1-nano",
+        "google/gemini-3.8-flash",
+    ]
+    assert isinstance(create_llm_client(gw_settings), VercelGatewayClient)
+
+    monkeypatch.setenv("LLM_PROVIDER", "gemini")
+    with pytest.raises(ValidationError):
+        get_settings()
+
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-secret")
+    gem_settings = get_settings()
+    assert isinstance(create_llm_client(gem_settings), GeminiClient)
 
 
-def test_multi_field_extraction_and_private_flow_skips_insurance() -> None:
+def test_hybrid_flow_uses_0_token_fast_paths_and_1_call_llm_replies() -> None:
     llm = FakeLLM(
         analyses=[
             TurnAnalysis(
                 extracted=ExtractedPatientFields(
                     full_name="Ana Paula Ribeiro",
-                    date_of_birth_iso="1990-03-10",
                     address="Av. Paulista, 1000, São Paulo - SP, 01310-100",
-                    coverage_type="particular",
-                )
+                ),
+                assistant_reply=(
+                    "Obrigada, Ana Paula! Anotei seu endereço também. "
+                    "Qual é a sua data de nascimento?"
+                ),
             ),
             TurnAnalysis(
                 extracted=ExtractedPatientFields(chief_complaint="Check-up anual"),
+                assistant_reply=None,
             ),
-            TurnAnalysis(confirmation_intent="confirm"),
-        ],
-        replies=["Perfeito, Ana! Qual é a queixa principal ou motivo da consulta?"],
+        ]
     )
     agent = IntakeAgent(llm=llm, clinic_name="Clínica Teste")
 
@@ -79,21 +78,42 @@ def test_multi_field_extraction_and_private_flow_skips_insurance() -> None:
     assert "LGPD" in greeting
     assert agent.state.transcript[0].actor == "assistant"
 
-    r1 = agent.handle_message(
-        "Ana Paula Ribeiro, nasci em 10/03/1990, moro na Av. Paulista 1000 SP, particular"
-    )
+    # Turn 1: multi-field natural text -> 1 unified LLM call
+    r1 = agent.handle_message("Ana Paula Ribeiro, moro na Av. Paulista 1000, São Paulo SP")
+    assert r1.used_llm is True
     assert r1.status == ConversationStatus.COLLECTING
-    assert r1.patient_info.missing_fields() == ["chief_complaint"]
+    assert "Obrigada, Ana Paula!" in r1.message
+    assert r1.patient_info.missing_fields() == [
+        "date_of_birth",
+        "coverage_type",
+        "chief_complaint",
+    ]
 
-    r2 = agent.handle_message("Quero fazer um check-up anual")
-    assert r2.status == ConversationStatus.CONFIRMING
-    assert "Particular" in r2.message
-    assert "Operadora" not in r2.message
+    # Turn 2: exact DD/MM/AAAA date -> 0 tokens fast-path
+    r2 = agent.handle_message("10/03/1990")
+    assert r2.used_llm is False
+    assert r2.patient_info.missing_fields() == ["coverage_type", "chief_complaint"]
 
-    r3 = agent.handle_message("sim, tudo certo")
-    assert r3.status == ConversationStatus.COMPLETED
-    assert r3.is_finished is True
-    assert "Ana Paula Ribeiro" in r3.message
+    # Turn 3: closed choice "particular" -> 0 tokens fast-path (skips insurance fields)
+    r3 = agent.handle_message("particular")
+    assert r3.used_llm is False
+    assert r3.patient_info.coverage_type == CoverageType.PRIVATE
+    assert r3.patient_info.missing_fields() == ["chief_complaint"]
+
+    # Turn 4: free-text complaint -> 1 unified LLM call transitions to CONFIRMING
+    r4 = agent.handle_message("Quero fazer um check-up anual")
+    assert r4.used_llm is True
+    assert r4.status == ConversationStatus.CONFIRMING
+    assert "Particular" in r4.message
+    assert "Operadora" not in r4.message
+
+    # Turn 5: "sim" confirmation -> 0 tokens fast-path
+    r5 = agent.handle_message("sim")
+    assert r5.used_llm is False
+    assert r5.status == ConversationStatus.COMPLETED
+    assert r5.is_finished is True
+    assert "Ana Paula Ribeiro" in r5.message
+    assert len(llm.analysis_payloads) == 2
 
 
 def test_insurance_branch_and_confirmation_edit_flow() -> None:
@@ -119,9 +139,7 @@ def test_insurance_branch_and_confirmation_edit_flow() -> None:
                     address="Rua Minas Gerais, 99, Belo Horizonte - MG, 30170-020"
                 )
             ),
-            TurnAnalysis(confirmation_intent="confirm"),
-        ],
-        replies=["Sem problemas! Qual é o novo endereço completo?"],
+        ]
     )
     agent = IntakeAgent(llm=llm)
 
@@ -130,6 +148,7 @@ def test_insurance_branch_and_confirmation_edit_flow() -> None:
     assert r1.patient_info.coverage_type == CoverageType.INSURANCE
 
     r2 = agent.handle_message("Não, quero corrigir meu endereço")
+    assert r2.used_llm is True
     assert r2.status == ConversationStatus.COLLECTING
     assert r2.patient_info.address is None
     assert r2.is_finished is False
@@ -138,7 +157,13 @@ def test_insurance_branch_and_confirmation_edit_flow() -> None:
     assert r3.status == ConversationStatus.CONFIRMING
     assert "Rua Minas Gerais, 99" in r3.message
 
-    r4 = agent.handle_message("sim")
+    # Confirmation "não" fast-path asks which field to edit without LLM call
+    r3_edit = agent.handle_message("não")
+    assert r3_edit.used_llm is False
+    assert r3_edit.status == ConversationStatus.CONFIRMING
+
+    r4 = agent.handle_message("tudo certo")
+    assert r4.used_llm is False
     assert r4.status == ConversationStatus.COMPLETED
     assert r4.is_finished is True
 
@@ -183,6 +208,7 @@ def test_emergency_red_flag_stops_deterministically_without_llm_call() -> None:
     reply = agent.handle_message("Estou com dor muito forte no peito e falta de ar")
     assert reply.status == ConversationStatus.EMERGENCY
     assert reply.is_finished is True
+    assert reply.used_llm is False
     assert "192" in reply.message
     assert llm.analysis_payloads == []
 
@@ -194,6 +220,7 @@ def test_llm_red_flag_also_triggers_emergency() -> None:
     reply = agent.handle_message("Acho que meu braço esquerdo ficou dormente de repente")
     assert reply.status == ConversationStatus.EMERGENCY
     assert reply.is_finished is True
+    assert reply.used_llm is True
     assert "192" in reply.message
 
 
@@ -216,18 +243,23 @@ def test_llm_error_surfaces_explicitly_instead_of_fake_validation_error() -> Non
 
     reply = agent.handle_message("Meu nome é Pedro Henrique")
     assert reply.error == "quota exceeded"
+    assert reply.used_llm is True
     assert "instabilidade" in reply.message.lower()
     assert reply.status == ConversationStatus.COLLECTING
 
 
-def test_reply_generation_error_falls_back_gracefully() -> None:
+def test_validation_error_overrides_llm_assistant_reply_with_deterministic_question() -> None:
     llm = FakeLLM(
-        analyses=[TurnAnalysis(extracted=ExtractedPatientFields(full_name="Lucas Ferreira"))],
-        replies=[LLMError("timeout")],
+        analyses=[
+            TurnAnalysis(
+                extracted=ExtractedPatientFields(full_name="12345"),
+                assistant_reply="Ótimo, 12345! Agora me diga sua data de nascimento.",
+            )
+        ]
     )
     agent = IntakeAgent(llm=llm)
 
-    reply = agent.handle_message("Meu nome é Lucas Ferreira")
-    assert reply.error == "timeout"
-    assert "data de nascimento" in reply.message.lower()
-    assert reply.patient_info.full_name == "Lucas Ferreira"
+    reply = agent.handle_message("12345")
+    assert reply.patient_info.full_name is None
+    assert "nome válido" in reply.message.lower()
+    assert "Ótimo, 12345!" not in reply.message

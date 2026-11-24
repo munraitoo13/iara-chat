@@ -10,10 +10,10 @@
 ## Architecture
 
 - Source code follows a `src/` layout under `src/iara/`:
-  - `config.py`: Lazy `pydantic-settings` configuration (`get_settings()`). Never instantiate `Settings()` at import time.
-  - `models/`: Pydantic domain models (`PatientInfo`, `TranscriptItem`) and structured LLM extraction schemas (`TurnAnalysis`, `ExtractedPatientFields`).
-  - `services/llm.py`: `LLMClient` protocol and stateless `GeminiClient` wrapper around `google-genai` (`client.models.generate_content`), keeping extraction and conversational generation isolated.
-  - `conversation/`: State management (`state.py`), deterministic guardrails (`guardrails.py`), JSON-safe prompt builders (`prompts.py`), and `IntakeAgent` (`engine.py`).
+  - `config.py`: Lazy `pydantic-settings` configuration (`get_settings()`). Supports `LLM_PROVIDER=vercel_gateway` (default) and `LLM_PROVIDER=gemini`. Never instantiate `Settings()` at import time.
+  - `models/`: Pydantic domain models (`PatientInfo`, `TranscriptItem`) and unified single-call structured LLM schema (`TurnAnalysis`, `ExtractedPatientFields`).
+  - `services/llm.py`: `LLMClient` protocol, `VercelGatewayClient` (OpenAI-compatible `https://ai-gateway.vercel.sh/v1` with `chat.completions.parse`), stateless `GeminiClient`, and `create_llm_client()`.
+  - `conversation/`: State management (`state.py`), deterministic guardrails and 0-token fast-paths (`guardrails.py`), JSON-safe unified prompt builder (`prompts.py`), and hybrid `IntakeAgent` (`engine.py`).
   - `cli.py` / `__main__.py`: Development CLI entrypoint (`uv run iara` / `uv run python -m iara`).
 
 ## Language Conventions
@@ -37,7 +37,7 @@ Always run `ruff check .`, `ruff format --check .`, and `pytest -v` before commi
 
 ## Security & LGPD Hygiene
 
-- Never commit `.env` files, API keys (`GEMINI_API_KEY`), or credentials. Only `.env.example` belongs in Git.
+- Never commit `.env` files, API keys (`AI_GATEWAY_API_KEY`, `GEMINI_API_KEY`), or credentials. Only `.env.example` belongs in Git.
 - Never interpolate raw `user_input` using Python `str.format()` — serialize inputs safely via JSON payloads.
 - Treat clinical and patient intake data (name, DOB, address, insurance ID, chief complaint) as sensitive under LGPD: avoid logging raw PHI/PII or secrets.
 - Always ask the user explicitly before running `git push` or any destructive Git operation.

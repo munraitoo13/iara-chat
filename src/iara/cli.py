@@ -6,26 +6,24 @@ from pydantic import ValidationError
 
 from iara.config import get_settings
 from iara.conversation.engine import IntakeAgent
-from iara.services.llm import GeminiClient
+from iara.services.llm import create_llm_client
 
 
 def main() -> None:
-    """Run an interactive CLI session against the configured Gemini model."""
+    """Run an interactive CLI session against the configured LLM provider."""
 
     try:
         settings = get_settings()
-    except ValidationError:
+    except ValidationError as exc:
         print(
-            "Erro de configuração: defina GEMINI_API_KEY no arquivo .env "
-            "(copie .env.example para .env).",
+            "Erro de configuração: copie .env.example para .env e defina "
+            "AI_GATEWAY_API_KEY (ou GEMINI_API_KEY se LLM_PROVIDER=gemini).\n"
+            f"Detalhe: {exc.errors()[0]['msg']}",
             file=sys.stderr,
         )
         raise SystemExit(1) from None
 
-    llm = GeminiClient(
-        api_key=settings.gemini_api_key.get_secret_value(),
-        model=settings.gemini_model,
-    )
+    llm = create_llm_client(settings)
     agent = IntakeAgent(
         llm=llm,
         clinic_name=settings.clinic_name,
@@ -33,7 +31,9 @@ def main() -> None:
         max_turns=settings.max_turns,
     )
 
-    print(f"=== {settings.clinic_name} (Modo CLI Dev) ===")
+    print(
+        f"=== {settings.clinic_name} ({settings.llm_provider}: {settings.active_model_name()}) ==="
+    )
     print("Digite 'sair' a qualquer momento para encerrar.\n")
     print(f"Iara: {agent.greeting()}\n")
 
@@ -49,7 +49,8 @@ def main() -> None:
             break
 
         reply = agent.handle_message(user_input)
-        print(f"\nIara: {reply.message}\n")
+        mode_tag = "[1 chamada · LLM]" if reply.used_llm else "[0 tokens · fast-path]"
+        print(f"\nIara {mode_tag}: {reply.message}\n")
         if reply.error:
             print(f"[aviso técnico: {reply.error}]\n", file=sys.stderr)
         if reply.is_finished:

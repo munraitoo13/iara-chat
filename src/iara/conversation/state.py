@@ -32,4 +32,5 @@ class AgentReply(BaseModel):
     status: ConversationStatus
     patient_info: PatientInfo
     is_finished: bool
+    used_llm: bool = False
     error: str | None = None
