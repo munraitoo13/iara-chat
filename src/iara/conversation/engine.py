@@ -1,10 +1,12 @@
 """Core conversational engine for intake, scheduling, and human-in-the-loop handoff."""
 
+from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 from iara.conversation.guardrails import (
     EMERGENCY_RESPONSE_PTBR,
     detect_human_handoff_request,
+    detect_protocol_action,
     detect_red_flag_keywords,
     match_collecting_fast_path,
     match_confirmation_fast_path,
@@ -25,6 +27,7 @@ from iara.models.scheduling import (
     SPECIALTY_LABELS_PTBR,
     AppointmentSlotDTO,
     BookedAppointmentDTO,
+    NoticeWindowError,
     Specialty,
     suggest_specialty_from_complaint,
 )
@@ -34,6 +37,8 @@ _UPDATABLE_FIELDS = frozenset(
     {
         "full_name",
         "date_of_birth",
+        "phone",
+        "email",
         "address",
         "coverage_type",
         "insurance_payer",
@@ -65,6 +70,32 @@ class SchedulingProvider(Protocol):
         """Reserve an available slot for the given intake session."""
         ...
 
+    def find_appointment_by_protocol(self, protocol: str) -> BookedAppointmentDTO | None:
+        """Look up a confirmed appointment by protocol prefix or UUID."""
+        ...
+
+    def cancel_appointment(
+        self,
+        appointment_id: str,
+        *,
+        reason: str | None = None,
+        enforce_notice_window: bool = False,
+        now: datetime | None = None,
+    ) -> BookedAppointmentDTO | None:
+        """Cancel a confirmed appointment and free its slot."""
+        ...
+
+    def reschedule_appointment(
+        self,
+        appointment_id: str,
+        new_slot_id: int,
+        *,
+        enforce_notice_window: bool = False,
+        now: datetime | None = None,
+    ) -> BookedAppointmentDTO | None:
+        """Move an appointment to a new slot."""
+        ...
+
 
 class IntakeAgent:
     """Hybrid conversational agent combining 0-token fast-paths, scheduling, and handoff."""
@@ -78,6 +109,7 @@ class IntakeAgent:
         state: ConversationState | None = None,
         scheduler: SchedulingProvider | None = None,
         session_id: str | None = None,
+        min_cancel_notice_hours: int = 2,
     ) -> None:
         self.llm = llm
         self.clinic_name = clinic_name
@@ -86,6 +118,7 @@ class IntakeAgent:
         self.state = state or ConversationState()
         self.scheduler = scheduler
         self.session_id = session_id
+        self.min_cancel_notice_hours = min_cancel_notice_hours
         self._turn_system_prompt = build_turn_system_prompt(clinic_name)
 
     def greeting(self) -> str:
@@ -110,7 +143,7 @@ class IntakeAgent:
                 used_llm=False,
             )
 
-        if self.state.status in (ConversationStatus.COMPLETED, ConversationStatus.EMERGENCY):
+        if self.state.status == ConversationStatus.EMERGENCY:
             return self._build_reply(
                 "Este atendimento já foi encerrado. Inicie uma nova conversa para outro cadastro.",
                 used_llm=False,
@@ -121,6 +154,22 @@ class IntakeAgent:
             return self._build_reply(length_error, used_llm=False)
 
         cleaned_input = user_input.strip()
+
+        if self.scheduler is not None and self.state.status not in (
+            ConversationStatus.WAITING_HUMAN,
+            ConversationStatus.HUMAN_TAKEOVER,
+        ):
+            protocol_action = detect_protocol_action(cleaned_input)
+            if protocol_action is not None:
+                self.state.turn_count += 1
+                self._record("user", cleaned_input)
+                return self._handle_protocol_action(protocol_action[0], protocol_action[1])
+
+        if self.state.status == ConversationStatus.COMPLETED:
+            return self._build_reply(
+                "Este atendimento já foi encerrado. Inicie uma nova conversa para outro cadastro.",
+                used_llm=False,
+            )
 
         if self.state.status == ConversationStatus.HUMAN_TAKEOVER:
             self.state.turn_count += 1
@@ -335,6 +384,12 @@ class IntakeAgent:
                 "No momento não encontrei horários disponíveis na agenda automática. "
                 "Encaminhei seu pré-cadastro para nossa recepção humana confirmar o melhor encaixe."
             )
+        elif reason in ("late_cancellation_request", "late_reschedule_request"):
+            msg = (
+                f"Cancelamentos e remarcações automáticas são aceitos até "
+                f"{self.min_cancel_notice_hours}h antes da consulta. "
+                "Já encaminhei seu pedido para nossa recepção humana avaliar o encaixe."
+            )
         else:
             msg = (
                 "Combinado! Já sinalizei nossa equipe de recepção para assumir seu atendimento "
@@ -478,11 +533,81 @@ class IntakeAgent:
         )
         return self._present_slots_for_specialty(specialty, header=header, used_llm=used_llm)
 
+    def _handle_protocol_action(self, action: str, protocol: str) -> AgentReply:
+        assert self.scheduler is not None
+        appt = self.scheduler.find_appointment_by_protocol(protocol)
+        if appt is None:
+            msg = (
+                f"Não encontrei nenhuma consulta confirmada com o protocolo #{protocol.upper()}. "
+                "Confira o código informado ou peça para falar com um atendente."
+            )
+            self._record("assistant", msg)
+            return self._build_reply(msg, used_llm=False)
+
+        short_code = appt.appointment_id[:8].upper()
+        if action == "cancel":
+            try:
+                cancelled = self.scheduler.cancel_appointment(
+                    appt.appointment_id,
+                    reason="patient_self_service",
+                    enforce_notice_window=True,
+                )
+            except NoticeWindowError:
+                return self._escalate_to_human(reason="late_cancellation_request", used_llm=False)
+
+            if cancelled is None:
+                msg = f"Não foi possível cancelar a consulta #{short_code}."
+                self._record("assistant", msg)
+                return self._build_reply(msg, used_llm=False)
+
+            self.state.booked_appointment = None
+            self.state.reschedule_appointment_id = None
+            self.state.status = ConversationStatus.COMPLETED
+            date_str = cancelled.starts_at.strftime("%d/%m/%Y às %H:%M")
+            msg = (
+                f"Consulta #{short_code} ({cancelled.specialty_label} com "
+                f"{cancelled.doctor_name} em {date_str}) cancelada com sucesso. "
+                "O horário já foi liberado na agenda."
+            )
+            self._record("assistant", msg)
+            return self._build_reply(msg, used_llm=False)
+
+        # Reschedule path: check notice window upfront before showing new slots
+        tz = appt.starts_at.tzinfo or UTC
+        if appt.starts_at - datetime.now(tz) < timedelta(hours=self.min_cancel_notice_hours):
+            return self._escalate_to_human(reason="late_reschedule_request", used_llm=False)
+
+        self.state.reschedule_appointment_id = appt.appointment_id
+        self.state.patient_info.preferred_specialty = appt.specialty
+        if not self.state.patient_info.full_name and appt.patient_name:
+            self.state.patient_info.full_name = appt.patient_name
+        header = (
+            f"Encontrei sua consulta #{short_code} ({appt.specialty_label} com "
+            f"{appt.doctor_name}). Escolha o novo horário abaixo:"
+        )
+        return self._present_slots_for_specialty(appt.specialty, header=header, used_llm=False)
+
     def _book_selected_slot(self, slot: AppointmentSlotDTO, *, used_llm: bool) -> AgentReply:
         assert self.scheduler is not None
         session_ref = self.session_id or "cli-session"
         patient_name = self.state.patient_info.full_name or "Paciente"
-        booked = self.scheduler.book_slot(session_ref, slot.slot_id, patient_name)
+
+        if self.state.reschedule_appointment_id is not None:
+            try:
+                booked = self.scheduler.reschedule_appointment(
+                    self.state.reschedule_appointment_id,
+                    slot.slot_id,
+                    enforce_notice_window=True,
+                )
+            except NoticeWindowError:
+                return self._escalate_to_human(reason="late_reschedule_request", used_llm=used_llm)
+            except ValueError:
+                booked = None
+            was_reschedule = True
+        else:
+            booked = self.scheduler.book_slot(session_ref, slot.slot_id, patient_name)
+            was_reschedule = False
+
         if booked is None:
             specialty = self.state.patient_info.preferred_specialty or Specialty.GENERAL_PRACTICE
             return self._present_slots_for_specialty(
@@ -491,18 +616,21 @@ class IntakeAgent:
                 used_llm=used_llm,
             )
 
+        self.state.reschedule_appointment_id = None
         self.state.booked_appointment = booked
         self.state.status = ConversationStatus.COMPLETED
         protocol = booked.appointment_id[:8].upper()
         date_str = booked.starts_at.strftime("%d/%m/%Y às %H:%M")
+        title = "Remarcação confirmada" if was_reschedule else "Agendamento confirmado"
         msg = (
-            f"Agendamento confirmado, {patient_name}!\n\n"
+            f"{title}, {patient_name}!\n\n"
             f"- Protocolo: #{protocol}\n"
             f"- Especialidade: {booked.specialty_label}\n"
             f"- Profissional: {booked.doctor_name}\n"
             f"- Data e hora: {date_str}\n\n"
-            f"A {self.clinic_name} agradece o contato. Caso precise remarcar, "
-            "nossa equipe está à disposição."
+            f"A {self.clinic_name} agradece o contato. Caso precise alterar, "
+            f"você pode cancelar ou remarcar pelo código #{protocol} até "
+            f"{self.min_cancel_notice_hours}h antes."
         )
         self._record("assistant", msg)
         return self._build_reply(msg, used_llm=used_llm)

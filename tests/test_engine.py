@@ -89,6 +89,7 @@ def test_hybrid_flow_uses_0_token_fast_paths_and_1_call_llm_replies() -> None:
     assert "Obrigada, Ana Paula!" in r1.message
     assert r1.patient_info.missing_fields() == [
         "date_of_birth",
+        "phone",
         "coverage_type",
         "chief_complaint",
     ]
@@ -96,7 +97,13 @@ def test_hybrid_flow_uses_0_token_fast_paths_and_1_call_llm_replies() -> None:
     # Turn 2: exact DD/MM/AAAA date -> 0 tokens fast-path
     r2 = agent.handle_message("10/03/1990")
     assert r2.used_llm is False
-    assert r2.patient_info.missing_fields() == ["coverage_type", "chief_complaint"]
+    assert r2.patient_info.missing_fields() == ["phone", "coverage_type", "chief_complaint"]
+
+    # Turn 2b: Brazilian phone -> 0 tokens fast-path
+    r_phone = agent.handle_message("11987654321")
+    assert r_phone.used_llm is False
+    assert r_phone.patient_info.phone == "(11) 98765-4321"
+    assert r_phone.patient_info.missing_fields() == ["coverage_type", "chief_complaint"]
 
     # Turn 3: closed choice "particular" -> 0 tokens fast-path (skips insurance fields)
     r3 = agent.handle_message("particular")
@@ -108,6 +115,7 @@ def test_hybrid_flow_uses_0_token_fast_paths_and_1_call_llm_replies() -> None:
     r4 = agent.handle_message("Quero fazer um check-up anual")
     assert r4.used_llm is True
     assert r4.status == ConversationStatus.CONFIRMING
+    assert "(11) 98765-4321" in r4.message
     assert "Particular" in r4.message
     assert "Operadora" not in r4.message
 
@@ -127,6 +135,7 @@ def test_insurance_branch_and_confirmation_edit_flow() -> None:
                 extracted=ExtractedPatientFields(
                     full_name="Carlos Mendes",
                     date_of_birth_iso="1985-08-20",
+                    phone="(31) 99999-1111",
                     address="Rua Bahia, 45, Belo Horizonte - MG, 30160-010",
                     coverage_type="convenio",
                     insurance_payer="Unimed",
@@ -179,6 +188,7 @@ def test_switching_from_insurance_to_private_clears_insurance_fields() -> None:
                 extracted=ExtractedPatientFields(
                     full_name="Bruno Lima",
                     date_of_birth_iso="1995-01-05",
+                    phone="(41) 98888-2222",
                     address="Rua Central, 200, Curitiba - PR, 80010-000",
                     coverage_type="convenio",
                     insurance_payer="Bradesco Saúde",

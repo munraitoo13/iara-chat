@@ -3,9 +3,12 @@
 from datetime import date
 
 from iara.conversation.guardrails import (
+    detect_protocol_action,
     detect_red_flag_keywords,
     match_collecting_fast_path,
     match_confirmation_fast_path,
+    normalize_brazilian_phone,
+    normalize_email,
     validate_and_normalize_fields,
     validate_input_length,
 )
@@ -98,3 +101,38 @@ def test_validate_and_normalize_fields_rejects_invalid_values() -> None:
 
     assert updates == {}
     assert len(errors) == 6
+
+
+def test_phone_email_normalization_and_protocol_action_fast_paths() -> None:
+    assert normalize_brazilian_phone("+55 (11) 98765-4321") == "(11) 98765-4321"
+    assert normalize_brazilian_phone("1133445566") == "(11) 3344-5566"
+    assert normalize_brazilian_phone("99999999999") is None
+    assert normalize_brazilian_phone("123") is None
+
+    assert normalize_email("  Maria.Clara@Clinica.COM.br ") == "maria.clara@clinica.com.br"
+    assert normalize_email("sem-arroba") is None
+
+    phone_hit = match_collecting_fast_path("11987654321", "phone")
+    assert phone_hit == ({"phone": "(11) 98765-4321"}, [])
+
+    bad_phone_hit = match_collecting_fast_path("12345678", "phone")
+    assert bad_phone_hit is not None
+    assert bad_phone_hit[0] == {}
+    assert len(bad_phone_hit[1]) == 1
+
+    extracted = ExtractedPatientFields(phone="11 912345678", email="ANA@TESTE.COM")
+    updates, errors = validate_and_normalize_fields(extracted, today=date(2026, 11, 24))
+    assert errors == []
+    assert updates == {"phone": "(11) 91234-5678", "email": "ana@teste.com"}
+
+    bad_extracted = ExtractedPatientFields(phone="00000000000", email="invalido@")
+    bad_updates, bad_errors = validate_and_normalize_fields(bad_extracted, today=date(2026, 11, 24))
+    assert bad_updates == {}
+    assert len(bad_errors) == 2
+
+    assert detect_protocol_action("Quero cancelar #A1B2C3D4") == ("cancel", "a1b2c3d4")
+    assert detect_protocol_action("Gostaria de remarcar meu horário ab12cd34") == (
+        "reschedule",
+        "ab12cd34",
+    )
+    assert detect_protocol_action("Quero cancelar minha consulta") is None

@@ -6,7 +6,11 @@ from pydantic import BaseModel, Field
 
 from iara.conversation.state import AgentReply, ConversationStatus
 from iara.models.patient import CoverageType, PatientInfo
-from iara.models.scheduling import AppointmentSlotDTO, BookedAppointmentDTO, Specialty
+from iara.models.scheduling import (
+    AppointmentSlotDTO,
+    BookedAppointmentDTO,
+    Specialty,
+)
 
 
 class QuickReplyOption(BaseModel):
@@ -110,12 +114,52 @@ class StaffUpdatePatientRequest(BaseModel):
 
     full_name: str | None = None
     date_of_birth: date | None = None
+    phone: str | None = None
+    email: str | None = None
     address: str | None = None
     coverage_type: CoverageType | None = None
     insurance_payer: str | None = None
     insurance_id: str | None = None
     chief_complaint: str | None = None
     preferred_specialty: Specialty | None = None
+
+
+class StaffCreateSlotRequest(BaseModel):
+    """Create a single available appointment slot."""
+
+    specialty: Specialty
+    doctor_name: str = Field(min_length=2, max_length=100)
+    starts_at: datetime
+
+
+class StaffBatchSlotsRequest(BaseModel):
+    """Generate a batch of calendar slots for a given day and hour window."""
+
+    specialty: Specialty
+    doctor_name: str = Field(min_length=2, max_length=100)
+    target_date: date
+    start_hour: int = Field(ge=6, le=21)
+    end_hour: int = Field(ge=7, le=22)
+    interval_minutes: int = Field(default=30, ge=15, le=120)
+
+
+class StaffCancelAppointmentRequest(BaseModel):
+    """Optional cancellation reason submitted by staff."""
+
+    reason: str | None = Field(default=None, max_length=300)
+
+
+class StaffRescheduleAppointmentRequest(BaseModel):
+    """Target new slot ID when staff reschedules an existing appointment."""
+
+    new_slot_id: int = Field(ge=1)
+
+
+class DispatchRemindersResponse(BaseModel):
+    """Result summary after running the due reminder dispatcher."""
+
+    dispatched: int
+    channel: str
 
 
 class StaffBookAppointmentRequest(BaseModel):

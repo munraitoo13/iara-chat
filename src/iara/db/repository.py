@@ -1,17 +1,17 @@
-"""Database engine setup and repository operations for intake, scheduling, and handoff."""
+"""Database engine setup and repository operations for intake, scheduling, and reminders."""
 
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from sqlalchemy.engine import Engine, make_url
-from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, SQLModel, create_engine, delete, select
 
 from iara.conversation.state import AgentReply, ConversationState, ConversationStatus
 from iara.db.models import (
     AppointmentRecord,
+    AppointmentReminderRecord,
     AppointmentSlotRecord,
     IntakeSessionRecord,
     TranscriptMessageRecord,
@@ -21,9 +21,12 @@ from iara.models.scheduling import (
     SPECIALTY_LABELS_PTBR,
     AppointmentSlotDTO,
     BookedAppointmentDTO,
+    NoticeWindowError,
+    ReminderDTO,
     Specialty,
     suggest_specialty_from_complaint,
 )
+from iara.services.reminders import ReminderSender
 
 _CLINIC_TZ = ZoneInfo("America/Sao_Paulo")
 
@@ -95,6 +98,14 @@ def _ensure_utc(dt: datetime) -> datetime:
     return dt
 
 
+def _to_utc(dt: datetime) -> datetime:
+    """Normalize local or naive datetimes (assumed clinic TZ) to UTC."""
+
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=_CLINIC_TZ).astimezone(UTC)
+    return dt.astimezone(UTC)
+
+
 def _slot_to_dto(record: AppointmentSlotRecord) -> AppointmentSlotDTO:
     specialty = Specialty(record.specialty)
     label = SPECIALTY_LABELS_PTBR[specialty]
@@ -116,6 +127,7 @@ def _appointment_to_dto(record: AppointmentRecord) -> BookedAppointmentDTO:
     return BookedAppointmentDTO(
         appointment_id=record.id,
         slot_id=record.slot_id,
+        patient_name=record.patient_name,
         specialty=specialty,
         specialty_label=SPECIALTY_LABELS_PTBR[specialty],
         doctor_name=record.doctor_name,
@@ -124,12 +136,66 @@ def _appointment_to_dto(record: AppointmentRecord) -> BookedAppointmentDTO:
     )
 
 
-class SessionRepository:
-    """Persistence adapter for clinical intake sessions, calendar slots, and staff handoff."""
+def _reminder_to_dto(record: AppointmentReminderRecord) -> ReminderDTO:
+    return ReminderDTO(
+        reminder_id=record.id or 0,
+        appointment_id=record.appointment_id,
+        patient_name=record.patient_name,
+        recipient_phone=record.recipient_phone,
+        recipient_email=record.recipient_email,
+        reminder_type=record.reminder_type,
+        channel=record.channel,
+        scheduled_for=_ensure_utc(record.scheduled_for).astimezone(_CLINIC_TZ),
+        status=record.status,
+        message_preview=record.message_preview,
+        sent_at=_ensure_utc(record.sent_at).astimezone(_CLINIC_TZ) if record.sent_at else None,
+        last_error=record.last_error,
+    )
 
-    def __init__(self, engine: Engine, session_timeout_minutes: int = 20) -> None:
+
+def _build_reminder_preview(
+    *,
+    clinic_name: str,
+    patient_name: str,
+    doctor_name: str,
+    specialty_label: str,
+    starts_at: datetime,
+    reminder_type: str,
+    protocol: str,
+) -> str:
+    local_dt = _ensure_utc(starts_at).astimezone(_CLINIC_TZ)
+    date_str = local_dt.strftime("%d/%m/%Y às %H:%M")
+    if reminder_type == "24h":
+        return (
+            f"Olá, {patient_name}! Lembrete da {clinic_name}: sua consulta de "
+            f"{specialty_label} com {doctor_name} é amanhã, {date_str} (Protocolo #{protocol}). "
+            "Se precisar remarcar ou cancelar, avise com antecedência."
+        )
+    return (
+        f"Olá, {patient_name}! Sua consulta na {clinic_name} com {doctor_name} "
+        f"({specialty_label}) começa em cerca de 2 horas ({date_str}, Protocolo #{protocol}). "
+        "Lembre-se de levar documento com foto e carteirinha do convênio, se aplicável."
+    )
+
+
+class SessionRepository:
+    """Persistence adapter for clinical intake, calendar slots, bookings, and reminders."""
+
+    def __init__(
+        self,
+        engine: Engine,
+        session_timeout_minutes: int = 20,
+        min_cancel_notice_hours: int = 2,
+    ) -> None:
         self.engine = engine
         self.session_timeout_minutes = session_timeout_minutes
+        self.min_cancel_notice_hours = min_cancel_notice_hours
+
+    def init_db(self) -> None:
+        """Create database tables and seed realistic calendar slots idempotently."""
+
+        SQLModel.metadata.create_all(self.engine)
+        self.seed_default_slots()
 
     def expire_stale_sessions(self, *, now: datetime | None = None) -> int:
         """Close idle open sessions beyond the inactivity threshold without booking slots."""
@@ -171,12 +237,6 @@ class SessionRepository:
                 db.commit()
 
         return expired_count
-
-    def init_db(self) -> None:
-        """Create database tables and seed realistic calendar slots idempotently."""
-
-        SQLModel.metadata.create_all(self.engine)
-        self.seed_default_slots()
 
     def seed_default_slots(self) -> None:
         """Populate initial weekday appointment slots when the calendar table is empty."""
@@ -224,21 +284,153 @@ class SessionRepository:
             rows = list(db.exec(stmt).all())
         return [_slot_to_dto(row) for row in rows]
 
+    def create_slot(
+        self,
+        *,
+        specialty: Specialty,
+        doctor_name: str,
+        starts_at: datetime,
+    ) -> AppointmentSlotDTO:
+        """Create a single calendar slot."""
+
+        utc_start = _to_utc(starts_at)
+        record = AppointmentSlotRecord(
+            specialty=specialty.value,
+            doctor_name=doctor_name.strip(),
+            starts_at=utc_start,
+            is_booked=False,
+        )
+        with Session(self.engine) as db:
+            db.add(record)
+            db.commit()
+            db.refresh(record)
+        return _slot_to_dto(record)
+
+    def create_slots_batch(
+        self,
+        *,
+        specialty: Specialty,
+        doctor_name: str,
+        target_date: date,
+        start_hour: int,
+        end_hour: int,
+        interval_minutes: int,
+    ) -> list[AppointmentSlotDTO]:
+        """Generate multiple slots within a day and time range."""
+
+        if end_hour <= start_hour:
+            raise ValueError("Hora final deve ser maior que a hora inicial.")
+
+        cursor = datetime(
+            target_date.year,
+            target_date.month,
+            target_date.day,
+            start_hour,
+            0,
+            tzinfo=_CLINIC_TZ,
+        )
+        end_dt = datetime(
+            target_date.year,
+            target_date.month,
+            target_date.day,
+            end_hour,
+            0,
+            tzinfo=_CLINIC_TZ,
+        )
+        delta = timedelta(minutes=interval_minutes)
+
+        created: list[AppointmentSlotRecord] = []
+        with Session(self.engine) as db:
+            while cursor < end_dt:
+                rec = AppointmentSlotRecord(
+                    specialty=specialty.value,
+                    doctor_name=doctor_name.strip(),
+                    starts_at=cursor.astimezone(UTC),
+                    is_booked=False,
+                )
+                db.add(rec)
+                created.append(rec)
+                cursor += delta
+            db.commit()
+            for rec in created:
+                db.refresh(rec)
+
+        return [_slot_to_dto(rec) for rec in created]
+
+    def delete_slot(self, slot_id: int) -> bool:
+        """Delete an unbooked slot; raises ValueError if slot has an active booking."""
+
+        with Session(self.engine) as db:
+            slot = db.get(AppointmentSlotRecord, slot_id)
+            if slot is None:
+                return False
+            if slot.is_booked:
+                raise ValueError("Não é possível remover um horário já reservado.")
+            db.delete(slot)
+            db.commit()
+            return True
+
+    def _schedule_reminders_for_appointment(
+        self,
+        db: Session,
+        *,
+        appointment: AppointmentRecord,
+        session_record: IntakeSessionRecord | None,
+        now: datetime,
+    ) -> None:
+        protocol = appointment.id[:8].upper()
+        specialty_label = SPECIALTY_LABELS_PTBR[Specialty(appointment.specialty)]
+        starts_utc = _ensure_utc(appointment.starts_at)
+
+        for label, hours_before in (("24h", 24), ("2h", 2)):
+            scheduled_for = starts_utc - timedelta(hours=hours_before)
+            if scheduled_for <= now:
+                continue
+            preview = _build_reminder_preview(
+                clinic_name=session_record.clinic_name if session_record else "Clínica",
+                patient_name=appointment.patient_name,
+                doctor_name=appointment.doctor_name,
+                specialty_label=specialty_label,
+                starts_at=starts_utc,
+                reminder_type=label,
+                protocol=protocol,
+            )
+            db.add(
+                AppointmentReminderRecord(
+                    appointment_id=appointment.id,
+                    session_id=appointment.session_id,
+                    patient_name=appointment.patient_name,
+                    recipient_phone=session_record.phone if session_record else None,
+                    recipient_email=session_record.email if session_record else None,
+                    reminder_type=label,
+                    channel="mock",
+                    scheduled_for=scheduled_for,
+                    status="pending",
+                    message_preview=preview,
+                )
+            )
+
     def book_slot(
         self,
         session_id: str,
         slot_id: int,
         patient_name: str,
+        *,
+        now: datetime | None = None,
     ) -> BookedAppointmentDTO | None:
-        """Atomically book a free calendar slot and link it to an intake session."""
+        """Atomically book a free slot and schedule 24h + 2h appointment reminders."""
 
+        ref_now = now or datetime.now(UTC)
         with Session(self.engine) as db:
             slot = db.get(AppointmentSlotRecord, slot_id)
             if slot is None or slot.is_booked:
                 return None
 
             existing_for_session = db.exec(
-                select(AppointmentRecord).where(AppointmentRecord.session_id == session_id)
+                select(AppointmentRecord).where(
+                    AppointmentRecord.session_id == session_id,
+                    AppointmentRecord.status == "confirmed",
+                )
             ).first()
             if existing_for_session is not None:
                 return _appointment_to_dto(existing_for_session)
@@ -253,15 +445,243 @@ class SessionRepository:
                 starts_at=slot.starts_at,
                 status="confirmed",
             )
+            session_record = db.get(IntakeSessionRecord, session_id)
             db.add(slot)
             db.add(appointment)
-            try:
-                db.commit()
-            except IntegrityError:
-                db.rollback()
-                return None
+            db.flush()
+            self._schedule_reminders_for_appointment(
+                db,
+                appointment=appointment,
+                session_record=session_record,
+                now=ref_now,
+            )
+            db.commit()
             db.refresh(appointment)
             return _appointment_to_dto(appointment)
+
+    def find_appointment_by_protocol(self, protocol: str) -> BookedAppointmentDTO | None:
+        """Look up a confirmed appointment by full UUID or 8-char protocol prefix."""
+
+        cleaned = protocol.strip().lstrip("#").lower()
+        if not cleaned:
+            return None
+
+        with Session(self.engine) as db:
+            rows = list(
+                db.exec(
+                    select(AppointmentRecord).where(AppointmentRecord.status == "confirmed")
+                ).all()
+            )
+        for row in rows:
+            if row.id.lower() == cleaned or row.id.lower().startswith(cleaned):
+                return _appointment_to_dto(row)
+        return None
+
+    def cancel_appointment(
+        self,
+        appointment_id: str,
+        *,
+        reason: str | None = None,
+        enforce_notice_window: bool = False,
+        now: datetime | None = None,
+    ) -> BookedAppointmentDTO | None:
+        """Cancel a confirmed appointment, free its slot, and cancel pending reminders."""
+
+        ref_now = now or datetime.now(UTC)
+        with Session(self.engine) as db:
+            appt = db.get(AppointmentRecord, appointment_id)
+            if appt is None:
+                return None
+            if appt.status != "confirmed":
+                raise ValueError("Esta consulta já não está confirmada.")
+
+            if enforce_notice_window:
+                remaining = _ensure_utc(appt.starts_at) - ref_now
+                if remaining < timedelta(hours=self.min_cancel_notice_hours):
+                    raise NoticeWindowError(
+                        f"Cancelamento automático permitido apenas com pelo menos "
+                        f"{self.min_cancel_notice_hours}h de antecedência."
+                    )
+
+            slot = db.get(AppointmentSlotRecord, appt.slot_id)
+            if slot is not None:
+                slot.is_booked = False
+                db.add(slot)
+
+            appt.status = "cancelled"
+            appt.cancel_reason = reason.strip() if reason else None
+            db.add(appt)
+
+            pending_reminders = list(
+                db.exec(
+                    select(AppointmentReminderRecord).where(
+                        AppointmentReminderRecord.appointment_id == appointment_id,
+                        AppointmentReminderRecord.status == "pending",
+                    )
+                ).all()
+            )
+            for rem in pending_reminders:
+                rem.status = "cancelled"
+                db.add(rem)
+
+            db.commit()
+            db.refresh(appt)
+            return _appointment_to_dto(appt)
+
+    def reschedule_appointment(
+        self,
+        appointment_id: str,
+        new_slot_id: int,
+        *,
+        enforce_notice_window: bool = False,
+        now: datetime | None = None,
+    ) -> BookedAppointmentDTO | None:
+        """Atomically move an appointment to a new free slot and regenerate reminders."""
+
+        ref_now = now or datetime.now(UTC)
+        with Session(self.engine) as db:
+            appt = db.get(AppointmentRecord, appointment_id)
+            if appt is None:
+                return None
+            if appt.status != "confirmed":
+                raise ValueError("Apenas consultas confirmadas podem ser remarcadas.")
+
+            if enforce_notice_window:
+                remaining = _ensure_utc(appt.starts_at) - ref_now
+                if remaining < timedelta(hours=self.min_cancel_notice_hours):
+                    raise NoticeWindowError(
+                        f"Remarcação automática permitida apenas com pelo menos "
+                        f"{self.min_cancel_notice_hours}h de antecedência."
+                    )
+
+            new_slot = db.get(AppointmentSlotRecord, new_slot_id)
+            if new_slot is None or new_slot.is_booked:
+                raise ValueError("Novo horário indisponível ou já reservado.")
+
+            old_slot = db.get(AppointmentSlotRecord, appt.slot_id)
+            if old_slot is not None:
+                old_slot.is_booked = False
+                db.add(old_slot)
+
+            new_slot.is_booked = True
+            db.add(new_slot)
+
+            pending_reminders = list(
+                db.exec(
+                    select(AppointmentReminderRecord).where(
+                        AppointmentReminderRecord.appointment_id == appointment_id,
+                        AppointmentReminderRecord.status == "pending",
+                    )
+                ).all()
+            )
+            for rem in pending_reminders:
+                rem.status = "cancelled"
+                db.add(rem)
+
+            appt.slot_id = new_slot_id
+            appt.specialty = new_slot.specialty
+            appt.doctor_name = new_slot.doctor_name
+            appt.starts_at = new_slot.starts_at
+            db.add(appt)
+
+            session_record = db.get(IntakeSessionRecord, appt.session_id)
+            if session_record is not None:
+                session_record.preferred_specialty = new_slot.specialty
+                session_record.reschedule_appointment_id = None
+                session_record.updated_at = ref_now
+                db.add(session_record)
+
+            db.flush()
+            self._schedule_reminders_for_appointment(
+                db,
+                appointment=appt,
+                session_record=session_record,
+                now=ref_now,
+            )
+            db.commit()
+            db.refresh(appt)
+            return _appointment_to_dto(appt)
+
+    def list_reminders(self, status_filter: str | None = None) -> list[ReminderDTO]:
+        """List scheduled, sent, or cancelled reminders ordered by target timestamp."""
+
+        with Session(self.engine) as db:
+            stmt = select(AppointmentReminderRecord).order_by(
+                AppointmentReminderRecord.scheduled_for  # type: ignore[arg-type]
+            )
+            if status_filter:
+                stmt = stmt.where(AppointmentReminderRecord.status == status_filter)
+            rows = list(db.exec(stmt).all())
+        return [_reminder_to_dto(row) for row in rows]
+
+    def _send_and_update_reminder(
+        self,
+        db: Session,
+        rec: AppointmentReminderRecord,
+        sender: ReminderSender,
+        channel: str,
+        now: datetime,
+    ) -> None:
+        subject = f"Lembrete de consulta ({rec.reminder_type})"
+        ok, err = sender.send(rec.recipient_email, subject, rec.message_preview)
+        rec.channel = channel
+        if ok:
+            rec.status = "sent"
+            rec.sent_at = now
+            rec.last_error = None
+        else:
+            rec.status = "failed"
+            rec.last_error = err
+        db.add(rec)
+
+    def dispatch_reminder_by_id(
+        self,
+        reminder_id: int,
+        sender: ReminderSender,
+        channel: str,
+        *,
+        now: datetime | None = None,
+    ) -> ReminderDTO | None:
+        """Immediately dispatch a single reminder (e.g. demo button in staff dashboard)."""
+
+        ref_now = now or datetime.now(UTC)
+        with Session(self.engine) as db:
+            rec = db.get(AppointmentReminderRecord, reminder_id)
+            if rec is None:
+                return None
+            if rec.status == "cancelled":
+                raise ValueError("Não é possível enviar um lembrete cancelado.")
+            self._send_and_update_reminder(db, rec, sender, channel, ref_now)
+            db.commit()
+            db.refresh(rec)
+            return _reminder_to_dto(rec)
+
+    def dispatch_due_reminders(
+        self,
+        sender: ReminderSender,
+        channel: str,
+        *,
+        now: datetime | None = None,
+    ) -> int:
+        """Dispatch all pending reminders whose scheduled time has arrived."""
+
+        ref_now = now or datetime.now(UTC)
+        processed = 0
+        with Session(self.engine) as db:
+            pending = list(
+                db.exec(
+                    select(AppointmentReminderRecord).where(
+                        AppointmentReminderRecord.status == "pending"
+                    )
+                ).all()
+            )
+            for rec in pending:
+                if _ensure_utc(rec.scheduled_for) <= ref_now:
+                    self._send_and_update_reminder(db, rec, sender, channel, ref_now)
+                    processed += 1
+            if processed:
+                db.commit()
+        return processed
 
     def create_session(self, clinic_name: str, greeting_message: str) -> LoadedSession:
         """Persist a new intake session along with its initial greeting."""
@@ -321,12 +741,17 @@ class SessionRepository:
                 ).all()
             )
             appointment_row = db.exec(
-                select(AppointmentRecord).where(AppointmentRecord.session_id == session_id)
+                select(AppointmentRecord).where(
+                    AppointmentRecord.session_id == session_id,
+                    AppointmentRecord.status == "confirmed",
+                )
             ).first()
 
         patient_info = PatientInfo(
             full_name=record.full_name,
             date_of_birth=record.date_of_birth,
+            phone=record.phone,
+            email=record.email,
             address=record.address,
             coverage_type=CoverageType(record.coverage_type) if record.coverage_type else None,
             insurance_payer=record.insurance_payer,
@@ -353,6 +778,7 @@ class SessionRepository:
             handoff_reason=record.handoff_reason,
             assigned_staff_name=record.assigned_staff_name,
             booked_appointment=_appointment_to_dto(appointment_row) if appointment_row else None,
+            reschedule_appointment_id=record.reschedule_appointment_id,
         )
         return LoadedSession(
             session_id=record.id,
@@ -382,8 +808,11 @@ class SessionRepository:
             record.consecutive_llm_errors = state.consecutive_llm_errors
             record.handoff_reason = state.handoff_reason
             record.assigned_staff_name = state.assigned_staff_name
+            record.reschedule_appointment_id = state.reschedule_appointment_id
             record.full_name = patient.full_name
             record.date_of_birth = patient.date_of_birth
+            record.phone = patient.phone
+            record.email = patient.email
             record.address = patient.address
             record.coverage_type = patient.coverage_type.value if patient.coverage_type else None
             record.insurance_payer = patient.insurance_payer
@@ -410,23 +839,29 @@ class SessionRepository:
             db.commit()
 
     def delete_session(self, session_id: str) -> bool:
-        """Delete a session, its transcript, and release any linked appointment (LGPD erasure)."""
+        """Delete a session, its transcript/reminders, and release slots (LGPD erasure)."""
 
         with Session(self.engine) as db:
             record = db.get(IntakeSessionRecord, session_id)
             if record is None:
                 return False
 
+            db.exec(
+                delete(AppointmentReminderRecord).where(
+                    AppointmentReminderRecord.session_id == session_id
+                )
+            )
             appointments = list(
                 db.exec(
                     select(AppointmentRecord).where(AppointmentRecord.session_id == session_id)
                 ).all()
             )
             for appt in appointments:
-                slot = db.get(AppointmentSlotRecord, appt.slot_id)
-                if slot is not None:
-                    slot.is_booked = False
-                    db.add(slot)
+                if appt.status == "confirmed":
+                    slot = db.get(AppointmentSlotRecord, appt.slot_id)
+                    if slot is not None:
+                        slot.is_booked = False
+                        db.add(slot)
                 db.delete(appt)
 
             db.exec(
@@ -461,7 +896,10 @@ class SessionRepository:
                 llm_turns = sum(1 for m in bot_msgs if m.used_llm)
                 fast_turns = sum(1 for m in bot_msgs if not m.used_llm)
                 appt = db.exec(
-                    select(AppointmentRecord).where(AppointmentRecord.session_id == rec.id)
+                    select(AppointmentRecord).where(
+                        AppointmentRecord.session_id == rec.id,
+                        AppointmentRecord.status == "confirmed",
+                    )
                 ).first()
                 rows.append(
                     StaffSessionRow(
@@ -484,15 +922,14 @@ class SessionRepository:
                 )
             return rows
 
-    def list_appointments(self) -> list[BookedAppointmentDTO]:
-        """Return all confirmed appointments sorted chronologically."""
+    def list_appointments(self, include_cancelled: bool = False) -> list[BookedAppointmentDTO]:
+        """Return confirmed (and optionally cancelled) appointments sorted chronologically."""
 
         with Session(self.engine) as db:
-            rows = list(
-                db.exec(
-                    select(AppointmentRecord).order_by(AppointmentRecord.starts_at)  # type: ignore[arg-type]
-                ).all()
-            )
+            stmt = select(AppointmentRecord).order_by(AppointmentRecord.starts_at)  # type: ignore[arg-type]
+            if not include_cancelled:
+                stmt = stmt.where(AppointmentRecord.status == "confirmed")
+            rows = list(db.exec(stmt).all())
         return [_appointment_to_dto(row) for row in rows]
 
     def staff_takeover(self, session_id: str, staff_name: str) -> LoadedSession | None:
@@ -663,6 +1100,8 @@ class SessionRepository:
             allowed = {
                 "full_name",
                 "date_of_birth",
+                "phone",
+                "email",
                 "address",
                 "coverage_type",
                 "insurance_payer",

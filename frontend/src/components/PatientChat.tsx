@@ -484,6 +484,13 @@ export function PatientChat() {
                   </span>
                 </div>
               </div>
+              <p className="mt-3 border-t border-emerald-200/70 pt-2.5 text-[11px] text-emerald-800/80">
+                Para cancelar ou remarcar depois, informe o código{" "}
+                <span className="font-semibold">
+                  #{bookedAppointment.appointment_id.slice(0, 8).toUpperCase()}
+                </span>{" "}
+                em uma nova conversa.
+              </p>
             </div>
           )}
 

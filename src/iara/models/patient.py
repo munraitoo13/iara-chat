@@ -19,6 +19,8 @@ class CoverageType(StrEnum):
 FIELD_LABELS_PTBR: dict[str, str] = {
     "full_name": "nome completo",
     "date_of_birth": "data de nascimento",
+    "phone": "telefone ou WhatsApp com DDD",
+    "email": "e-mail",
     "address": "endereço completo (rua, número, cidade, estado e CEP)",
     "coverage_type": "modalidade de atendimento (convênio ou particular)",
     "insurance_payer": "operadora do convênio",
@@ -32,6 +34,8 @@ class PatientInfo(BaseModel):
 
     full_name: str | None = None
     date_of_birth: date | None = None
+    phone: str | None = None
+    email: str | None = None
     address: str | None = None
     coverage_type: CoverageType | None = None
     insurance_payer: str | None = None
@@ -43,7 +47,7 @@ class PatientInfo(BaseModel):
         """Return ordered keys of fields that still need to be collected."""
 
         missing: list[str] = []
-        for field_name in ("full_name", "date_of_birth", "address", "coverage_type"):
+        for field_name in ("full_name", "date_of_birth", "phone", "address", "coverage_type"):
             if getattr(self, field_name) is None:
                 missing.append(field_name)
 
@@ -73,9 +77,16 @@ class PatientInfo(BaseModel):
         lines = [
             f"- Nome completo: {self.full_name or '-'}",
             f"- Data de nascimento: {dob_text}",
-            f"- Endereço: {self.address or '-'}",
-            f"- Atendimento: {coverage_label}",
+            f"- Telefone / WhatsApp: {self.phone or '-'}",
         ]
+        if self.email:
+            lines.append(f"- E-mail: {self.email}")
+        lines.extend(
+            [
+                f"- Endereço: {self.address or '-'}",
+                f"- Atendimento: {coverage_label}",
+            ]
+        )
         if self.coverage_type == CoverageType.INSURANCE:
             lines.append(f"- Operadora: {self.insurance_payer or '-'}")
             lines.append(f"- Carteirinha: {self.insurance_id or '-'}")

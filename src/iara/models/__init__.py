@@ -6,6 +6,7 @@ from iara.models.scheduling import (
     SPECIALTY_LABELS_PTBR,
     AppointmentSlotDTO,
     BookedAppointmentDTO,
+    ReminderDTO,
     Specialty,
     suggest_specialty_from_complaint,
 )
@@ -17,6 +18,7 @@ __all__ = [
     "CoverageType",
     "ExtractedPatientFields",
     "PatientInfo",
+    "ReminderDTO",
     "Specialty",
     "TranscriptItem",
     "TurnAnalysis",

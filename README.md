@@ -6,20 +6,20 @@
 
 A **Iara** separa claramente a experiência acolhedora do paciente da operação clínica:
 
-- **Interface do Paciente (`/` — Next.js):** chat minimalista e acolhedor sem métricas técnicas, com chips de resposta rápida, menu discreto (`Falar com atendente`, `Nova triagem`, `Apagar meus dados (LGPD)`), cartão de confirmação de consulta e sincronização automática quando um atendente assume.
-- **Dashboard da Clínica (`/dashboard` — Next.js):** fila de atendimentos em tempo real, visualização de histórico e telemetria híbrida (`0 tokens` vs `LLM`), intervenção humana (**Assumir atendimento** / responder / **Devolver para Iara** / **Encerrar**), agenda de consultas e métricas de economia.
-- **Backend Híbrido (`src/iara/`):** *fast-paths* determinísticos de 0 tokens + 1 única chamada estruturada (`TurnAnalysis`) via Vercel AI Gateway, agendamento atômico em SQLModel e API `/api/v1`.
+- **Interface do Paciente (`/` — Next.js):** chat minimalista e acolhedor sem métricas técnicas, com coleta de telefone/WhatsApp e e-mail opcional, chips de resposta rápida, menu discreto (`Falar com atendente`, `Nova triagem`, `Apagar meus dados (LGPD)`), cartão de confirmação com protocolo `#XXXXXXXX` (para cancelar/remarcar via chat) e sincronização automática quando um atendente assume.
+- **Dashboard da Clínica (`/dashboard` — Next.js):** fila de atendimentos em tempo real, Copiloto silencioso (*Preencher com IA*), intervenção humana, gestão completa da agenda (gerar horários em lote, remover horários livres, cancelar e remarcar consultas), painel de **Lembretes Programados (24h e 2h)** e métricas de economia.
+- **Backend Híbrido (`src/iara/`):** *fast-paths* determinísticos de 0 tokens (incluindo telefone BR e comandos `#PROTOCOLO`) + 1 única chamada estruturada (`TurnAnalysis`) via Vercel AI Gateway, agendamento/remarcação atômica em SQLModel, dispatcher de lembretes (Mock + Resend) e API `/api/v1`.
 
-### Arquitetura Atual (Fase 5)
+### Arquitetura Atual (Fase 6)
 
 ```text
 ├── src/iara/                    # Backend Python (FastAPI + SQLModel + Engine Híbrida)
-│   ├── config.py                # Configuração lazy (Gateway/Gemini, DB, CORS, STAFF_API_KEY)
-│   ├── models/                  # PatientInfo, Specialty, Slot/Appointment DTOs, TurnAnalysis
-│   ├── services/llm.py          # VercelGatewayClient + GeminiClient
-│   ├── conversation/            # IntakeAgent, guardrails 0-token, prompt unificado PT-BR
-│   ├── db/                      # SQLModel (sessions, messages, appointment_slots, appointments)
-│   ├── api/                     # FastAPI REST (/api/v1 e /api/v1/staff)
+│   ├── config.py                # Configuração lazy (Gateway/Gemini, DB, CORS, STAFF_API_KEY, Resend)
+│   ├── models/                  # PatientInfo (+ telefone/e-mail), Specialty, Slot/Appointment/Reminder DTOs
+│   ├── services/                # VercelGatewayClient, GeminiClient e ReminderSender (Mock + Resend)
+│   ├── conversation/            # IntakeAgent, guardrails 0-token (#PROTOCOLO + BR phone), prompt PT-BR
+│   ├── db/                      # SQLModel (sessions, messages, slots, appointments, appointment_reminders)
+│   ├── api/                     # FastAPI REST (/api/v1, /api/v1/staff/*) + loop de lembretes em lifespan
 │   └── cli.py                   # CLI de desenvolvimento (`uv run iara`)
 └── frontend/                    # Next.js 16 + React 19 + Tailwind CSS 4 + TypeScript
     └── src/
@@ -49,7 +49,7 @@ pnpm install
 cp .env.example .env.local
 ```
 
-Preencha `AI_GATEWAY_API_KEY` e `CLINIC_NAME` (ex.: `Clínica Modelo`) no `.env` da raiz.
+Preencha `AI_GATEWAY_API_KEY` e `CLINIC_NAME` (ex.: `Clínica Modelo`) no `.env` da raiz. Opcionalmente ajuste `MIN_CANCEL_NOTICE_HOURS=2` e configure `RESEND_API_KEY` + `RESEND_FROM_EMAIL` para envio real de e-mails de lembrete (`Mock` ativo por padrão).
 
 ## Como Executar
 
@@ -90,3 +90,4 @@ pnpm build
 - [x] **Fase 3 — API & SQLModel:** FastAPI (`/api/v1`), persistência SQLModel em SQLite e exclusão LGPD.
 - [x] **Fase 4 — Agendamento & Handoff:** Sugestão de especialidade, agenda SQLModel com trava contra duplo agendamento e API `/api/v1/staff`.
 - [x] **Fase 5 — Separação de UIs (Next.js):** Chat limpo do paciente (`/`) e Dashboard da clínica (`/dashboard`) com fila, agenda, métricas da IA e intervenção humana.
+- [x] **Fase 6 — Ciclo Completo da Consulta:** Telefone/WhatsApp + e-mail na triagem, CRUD/lote de horários, cancelamento/remarcação no dashboard e via `#PROTOCOLO` no chat (regra `2h`), e lembretes automáticos `24h` + `2h` (Mock / Resend).

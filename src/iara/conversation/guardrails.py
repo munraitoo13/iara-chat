@@ -92,8 +92,21 @@ _SPECIALTY_CHOICES: dict[str, Specialty] = {
 }
 
 _BR_DATE_RE = re.compile(r"^(\d{2})[/-](\d{2})[/-](\d{4})$")
+_PHONE_LIKE_RE = re.compile(r"^[\d\s().+-]{8,22}$")
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _SLOT_ID_RE = re.compile(r"^slot:(\d+)$")
 _SLOT_INDEX_RE = re.compile(r"^(?:opcao|horario|numero|#)?\s*(\d+)$")
+
+_CANCEL_INTENT_RE = re.compile(r"\b(cancelar|cancele|desmarcar|desmarque)\b")
+_RESCHEDULE_INTENT_RE = re.compile(
+    r"\b(remarcar|remarque|reagendar|reagende|trocar\s+(o\s+)?horario)\b"
+)
+_HASH_PROTOCOL_RE = re.compile(
+    r"#([0-9a-f]{8}(?:-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?)\b"
+)
+_PLAIN_PROTOCOL_RE = re.compile(
+    r"\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|(?=[0-9a-f]*\d)[0-9a-f]{8})\b"
+)
 
 _HANDOFF_PATTERNS = (
     re.compile(
@@ -161,6 +174,51 @@ def detect_human_handoff_request(text: str) -> bool:
 
     normalized = _strip_accents(text)
     return any(pattern.search(normalized) for pattern in _HANDOFF_PATTERNS)
+
+
+def detect_protocol_action(text: str) -> tuple[Literal["cancel", "reschedule"], str] | None:
+    """Detect self-service cancel/reschedule commands accompanied by an 8-char or UUID protocol."""
+
+    normalized = _strip_accents(text)
+    action: Literal["cancel", "reschedule"] | None = None
+    if _CANCEL_INTENT_RE.search(normalized):
+        action = "cancel"
+    elif _RESCHEDULE_INTENT_RE.search(normalized):
+        action = "reschedule"
+    if action is None:
+        return None
+
+    hash_match = _HASH_PROTOCOL_RE.search(normalized)
+    if hash_match:
+        return action, hash_match.group(1)
+
+    plain_match = _PLAIN_PROTOCOL_RE.search(normalized)
+    if plain_match:
+        return action, plain_match.group(1)
+
+    return None
+
+
+def normalize_brazilian_phone(raw: str) -> str | None:
+    """Normalize Brazilian landline/mobile numbers (10-11 digits with DDD)."""
+
+    digits = re.sub(r"\D", "", raw)
+    if digits.startswith("55") and len(digits) in (12, 13):
+        digits = digits[2:]
+    if len(digits) not in (10, 11) or digits[:2] == "00" or len(set(digits)) <= 1:
+        return None
+    if len(digits) == 11:
+        return f"({digits[:2]}) {digits[2:7]}-{digits[7:]}"
+    return f"({digits[:2]}) {digits[2:6]}-{digits[6:]}"
+
+
+def normalize_email(raw: str) -> str | None:
+    """Validate and lowercase an email address."""
+
+    cleaned = raw.strip().lower()
+    if _EMAIL_RE.fullmatch(cleaned):
+        return cleaned
+    return None
 
 
 def match_confirmation_fast_path(text: str) -> Literal["confirm", "edit"] | None:
@@ -233,6 +291,14 @@ def match_collecting_fast_path(
             return {"date_of_birth": parsed}, []
         return {}, ["Data de nascimento inválida. Informe uma data válida no formato DD/MM/AAAA."]
 
+    if next_missing_field == "phone" and _PHONE_LIKE_RE.fullmatch(text.strip()):
+        normalized_phone = normalize_brazilian_phone(text)
+        if normalized_phone is not None:
+            return {"phone": normalized_phone}, []
+        return {}, [
+            "Telefone inválido. Informe seu WhatsApp ou celular com DDD (ex.: (11) 99999-9999)."
+        ]
+
     return None
 
 
@@ -278,6 +344,22 @@ def validate_and_normalize_fields(
             errors.append(
                 "Data de nascimento inválida. Informe uma data válida no formato DD/MM/AAAA."
             )
+
+    if extracted.phone is not None:
+        normalized_phone = normalize_brazilian_phone(extracted.phone)
+        if normalized_phone is not None:
+            updates["phone"] = normalized_phone
+        else:
+            errors.append(
+                "Telefone inválido. Informe seu WhatsApp ou celular com DDD (ex.: (11) 99999-9999)."
+            )
+
+    if extracted.email is not None:
+        normalized_email = normalize_email(extracted.email)
+        if normalized_email is not None:
+            updates["email"] = normalized_email
+        else:
+            errors.append("E-mail inválido. Informe um endereço como nome@exemplo.com.")
 
     if extracted.address is not None:
         address = _collapse_spaces(extracted.address)

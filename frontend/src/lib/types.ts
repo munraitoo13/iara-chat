@@ -17,6 +17,8 @@ export type MessageActor = "user" | "assistant" | "human_agent" | "system";
 export interface PatientInfo {
   full_name: string | null;
   date_of_birth: string | null;
+  phone: string | null;
+  email: string | null;
   address: string | null;
   coverage_type: CoverageType | null;
   insurance_payer: string | null;
@@ -37,11 +39,27 @@ export interface AppointmentSlotDTO {
 export interface BookedAppointmentDTO {
   appointment_id: string;
   slot_id: number;
+  patient_name?: string | null;
   specialty: Specialty;
   specialty_label: string;
   doctor_name: string;
   starts_at: string;
   status: string;
+}
+
+export interface ReminderDTO {
+  reminder_id: number;
+  appointment_id: string;
+  patient_name: string;
+  recipient_phone: string | null;
+  recipient_email: string | null;
+  reminder_type: string;
+  channel: string;
+  scheduled_for: string;
+  status: string;
+  message_preview: string;
+  sent_at: string | null;
+  last_error: string | null;
 }
 
 export interface QuickReplyOption {
@@ -116,12 +134,34 @@ export interface StaffSessionSummary {
 export interface StaffUpdatePatientRequest {
   full_name?: string | null;
   date_of_birth?: string | null;
+  phone?: string | null;
+  email?: string | null;
   address?: string | null;
   coverage_type?: CoverageType | null;
   insurance_payer?: string | null;
   insurance_id?: string | null;
   chief_complaint?: string | null;
   preferred_specialty?: Specialty | null;
+}
+
+export interface StaffCreateSlotRequest {
+  specialty: Specialty;
+  doctor_name: string;
+  starts_at: string;
+}
+
+export interface StaffBatchSlotsRequest {
+  specialty: Specialty;
+  doctor_name: string;
+  target_date: string;
+  start_hour: number;
+  end_hour: number;
+  interval_minutes: number;
+}
+
+export interface DispatchRemindersResponse {
+  dispatched: number;
+  channel: string;
 }
 
 export interface StaffExtractResponse {

@@ -95,6 +95,7 @@ def test_end_to_end_scheduling_specialty_switch_booking_and_lgpd_release(
                 extracted=ExtractedPatientFields(
                     full_name="Fernanda Rocha",
                     date_of_birth_iso="1988-09-12",
+                    phone="(21) 99999-0000",
                     address="Rua das Laranjeiras, 300, Rio de Janeiro - RJ",
                     coverage_type="particular",
                     chief_complaint="Dor na coluna lombar",

@@ -16,6 +16,14 @@ class ExtractedPatientFields(BaseModel):
         default=None,
         description="Patient's date of birth converted to YYYY-MM-DD format if stated.",
     )
+    phone: str | None = Field(
+        default=None,
+        description="Patient's Brazilian phone or WhatsApp number with area code (DDD) if stated.",
+    )
+    email: str | None = Field(
+        default=None,
+        description="Patient's email address if explicitly stated.",
+    )
     address: str | None = Field(
         default=None,
         description="Patient's address (street, number, city, state, CEP) if stated.",

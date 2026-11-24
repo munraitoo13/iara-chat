@@ -4,6 +4,7 @@ import {
   Activity,
   ArrowLeft,
   BarChart3,
+  Bell,
   Bot,
   Calendar,
   CalendarPlus,
@@ -16,10 +17,12 @@ import {
   KeyRound,
   Lock,
   MessageSquare,
+  Plus,
   RefreshCw,
   Save,
   Send,
   Sparkles,
+  Trash2,
   UserCheck,
   UserRound,
   Volume2,
@@ -34,14 +37,21 @@ import {
   getHealth,
   listAvailableSlots,
   staffBookAppointment,
+  staffCancelAppointment,
   staffCloseSession,
+  staffCreateSlotsBatch,
+  staffDeleteSlot,
+  staffDispatchDueReminders,
   staffExtractPatient,
   staffGetSession,
   staffListAppointments,
+  staffListReminders,
   staffListSessions,
   staffOfferSlots,
   staffReleaseToAi,
+  staffRescheduleAppointment,
   staffSendMessage,
+  staffSendReminderNow,
   staffTakeoverSession,
   staffUpdatePatient,
 } from "@/lib/api";
@@ -53,6 +63,7 @@ import type {
   CoverageType,
   HealthResponse,
   PatientInfo,
+  ReminderDTO,
   SessionResponse,
   Specialty,
   StaffSessionSummary,
@@ -144,6 +155,21 @@ export function StaffDashboard() {
   const [sessions, setSessions] = useState<StaffSessionSummary[]>([]);
   const [appointments, setAppointments] = useState<BookedAppointmentDTO[]>([]);
   const [slots, setSlots] = useState<AppointmentSlotDTO[]>([]);
+  const [reminders, setReminders] = useState<ReminderDTO[]>([]);
+  const [agendaNotice, setAgendaNotice] = useState<string | null>(null);
+
+  const [cancellingId, setCancellingId] = useState<string | null>(null);
+  const [cancelReason, setCancelReason] = useState("");
+  const [reschedulingId, setReschedulingId] = useState<string | null>(null);
+  const [rescheduleSlots, setRescheduleSlots] = useState<AppointmentSlotDTO[]>([]);
+  const [rescheduleTargetSlotId, setRescheduleTargetSlotId] = useState<number | "">("");
+
+  const [batchSpecialty, setBatchSpecialty] = useState<Specialty>("clinica_geral");
+  const [batchDoctor, setBatchDoctor] = useState("Dra. Camila Rocha");
+  const [batchDate, setBatchDate] = useState("");
+  const [batchStartHour, setBatchStartHour] = useState(8);
+  const [batchEndHour, setBatchEndHour] = useState(12);
+  const [batchInterval, setBatchInterval] = useState(30);
 
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [activeSession, setActiveSession] = useState<SessionResponse | null>(null);
@@ -159,6 +185,8 @@ export function StaffDashboard() {
   const [patientDraft, setPatientDraft] = useState<PatientInfo>({
     full_name: null,
     date_of_birth: null,
+    phone: null,
+    email: null,
     address: null,
     coverage_type: null,
     insurance_payer: null,
@@ -178,23 +206,26 @@ export function StaffDashboard() {
     if (savedKey) setStaffKey(savedKey);
     if (savedName) setStaffName(savedName);
     if (savedMuted === "true") setIsMuted(true);
+    setBatchDate(new Date(Date.now() + 86_400_000).toISOString().slice(0, 10));
   }, []);
 
   const loadDashboardData = useCallback(
     async (keyOverride?: string | null) => {
       const activeKey = keyOverride !== undefined ? keyOverride : staffKey;
       try {
-        const [healthData, sessionRows, apptRows, slotRows] = await Promise.all([
+        const [healthData, sessionRows, apptRows, slotRows, reminderRows] = await Promise.all([
           getHealth().catch(() => null),
           staffListSessions(activeKey),
           staffListAppointments(activeKey),
           listAvailableSlots(specialtyFilter === "all" ? undefined : specialtyFilter),
+          staffListReminders(activeKey),
         ]);
 
         if (healthData) setHealth(healthData);
         setSessions(sessionRows);
         setAppointments(apptRows);
         setSlots(slotRows);
+        setReminders(reminderRows);
         setAuthRequired(false);
         setAuthError(null);
         setActionError(null);
@@ -357,6 +388,8 @@ export function StaffDashboard() {
         {
           full_name: patientDraft.full_name?.trim() || null,
           date_of_birth: patientDraft.date_of_birth?.trim() || null,
+          phone: patientDraft.phone?.trim() || null,
+          email: patientDraft.email?.trim() || null,
           address: patientDraft.address?.trim() || null,
           coverage_type: patientDraft.coverage_type,
           insurance_payer:
@@ -395,6 +428,145 @@ export function StaffDashboard() {
     await runStaffAction(() =>
       staffOfferSlots(activeSession.session_id, bookSpecialty, staffKey),
     );
+  };
+
+  const handleCreateSlotsBatch = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (actionBusy || !batchDoctor.trim() || !batchDate) return;
+    setActionBusy(true);
+    setActionError(null);
+    setAgendaNotice(null);
+    try {
+      const created = await staffCreateSlotsBatch(
+        {
+          specialty: batchSpecialty,
+          doctor_name: batchDoctor.trim(),
+          target_date: batchDate,
+          start_hour: batchStartHour,
+          end_hour: batchEndHour,
+          interval_minutes: batchInterval,
+        },
+        staffKey,
+      );
+      await loadDashboardData();
+      setAgendaNotice(
+        `${created.length} horário(s) adicionado(s) para ${batchDate.split("-").reverse().join("/")}.`,
+      );
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : "Falha ao gerar horários em lote.");
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
+  const handleDeleteSlot = async (slotId: number) => {
+    if (actionBusy) return;
+    setActionBusy(true);
+    setActionError(null);
+    setAgendaNotice(null);
+    try {
+      await staffDeleteSlot(slotId, staffKey);
+      await loadDashboardData();
+      setAgendaNotice("Horário removido da agenda.");
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : "Falha ao remover horário.");
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
+  const handleConfirmCancelAppointment = async (appointmentId: string) => {
+    if (actionBusy) return;
+    setActionBusy(true);
+    setActionError(null);
+    setAgendaNotice(null);
+    try {
+      await staffCancelAppointment(appointmentId, cancelReason.trim() || null, staffKey);
+      setCancellingId(null);
+      setCancelReason("");
+      await loadDashboardData();
+      setAgendaNotice("Consulta cancelada e horário devolvido à agenda.");
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : "Falha ao cancelar consulta.");
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
+  const handleOpenReschedule = async (appt: BookedAppointmentDTO) => {
+    if (actionBusy) return;
+    setActionError(null);
+    setAgendaNotice(null);
+    setCancellingId(null);
+    setReschedulingId(appt.appointment_id);
+    try {
+      const allFree = await listAvailableSlots();
+      const candidates = allFree.filter((s) => s.slot_id !== appt.slot_id);
+      setRescheduleSlots(candidates);
+      const preferred =
+        candidates.find((s) => s.specialty === appt.specialty) ?? candidates[0];
+      setRescheduleTargetSlotId(preferred ? preferred.slot_id : "");
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : "Falha ao carregar horários livres.");
+      setReschedulingId(null);
+    }
+  };
+
+  const handleConfirmReschedule = async (appointmentId: string) => {
+    if (actionBusy || !rescheduleTargetSlotId) return;
+    setActionBusy(true);
+    setActionError(null);
+    setAgendaNotice(null);
+    try {
+      await staffRescheduleAppointment(appointmentId, Number(rescheduleTargetSlotId), staffKey);
+      setReschedulingId(null);
+      await loadDashboardData();
+      setAgendaNotice("Consulta remarcada e novos lembretes programados.");
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : "Falha ao remarcar consulta.");
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
+  const handleSendReminderNow = async (reminderId: number) => {
+    if (actionBusy) return;
+    setActionBusy(true);
+    setActionError(null);
+    setAgendaNotice(null);
+    try {
+      const sent = await staffSendReminderNow(reminderId, staffKey);
+      await loadDashboardData();
+      setAgendaNotice(
+        sent.status === "sent"
+          ? `Lembrete enviado para ${sent.patient_name} via ${sent.channel}.`
+          : `Falha no envio: ${sent.last_error || "erro desconhecido"}`,
+      );
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : "Falha ao enviar lembrete.");
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
+  const handleDispatchDueReminders = async () => {
+    if (actionBusy) return;
+    setActionBusy(true);
+    setActionError(null);
+    setAgendaNotice(null);
+    try {
+      const res = await staffDispatchDueReminders(staffKey);
+      await loadDashboardData();
+      setAgendaNotice(
+        res.dispatched > 0
+          ? `${res.dispatched} lembrete(s) vencido(s) enviado(s) via ${res.channel}.`
+          : "Nenhum lembrete vencido pendente no momento.",
+      );
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : "Falha ao processar lembretes.");
+    } finally {
+      setActionBusy(false);
+    }
   };
 
   const filteredSessions = useMemo(() => {
@@ -1084,6 +1256,45 @@ export function StaffDashboard() {
                           </div>
                         )}
 
+                        <div className="grid grid-cols-2 gap-2">
+                          <div>
+                            <label className="mb-1 block text-[11px] font-medium text-[var(--muted)]">
+                              Telefone / WhatsApp
+                            </label>
+                            <input
+                              type="tel"
+                              placeholder="(11) 99999-9999"
+                              value={patientDraft.phone ?? ""}
+                              onChange={(e) =>
+                                setPatientDraft((p) => ({
+                                  ...p,
+                                  phone: e.target.value || null,
+                                }))
+                              }
+                              disabled={activeSession.is_finished}
+                              className="w-full rounded-xl border border-[var(--border)] bg-[var(--surface)] px-2.5 py-1.5 text-xs focus:border-[var(--primary)] focus:outline-none disabled:opacity-60"
+                            />
+                          </div>
+                          <div>
+                            <label className="mb-1 block text-[11px] font-medium text-[var(--muted)]">
+                              E-mail
+                            </label>
+                            <input
+                              type="email"
+                              placeholder="opcional@email.com"
+                              value={patientDraft.email ?? ""}
+                              onChange={(e) =>
+                                setPatientDraft((p) => ({
+                                  ...p,
+                                  email: e.target.value || null,
+                                }))
+                              }
+                              disabled={activeSession.is_finished}
+                              className="w-full rounded-xl border border-[var(--border)] bg-[var(--surface)] px-2.5 py-1.5 text-xs focus:border-[var(--primary)] focus:outline-none disabled:opacity-60"
+                            />
+                          </div>
+                        </div>
+
                         <div>
                           <label className="mb-1 block text-[11px] font-medium text-[var(--muted)]">
                             Endereço
@@ -1251,6 +1462,18 @@ export function StaffDashboard() {
       {/* TAB 2: CALENDAR */}
       {tab === "calendar" && (
         <div className="animate-fade-scale space-y-5">
+          {(actionError || agendaNotice) && (
+            <div
+              className={`rounded-2xl border px-4 py-3 text-xs font-medium ${
+                actionError
+                  ? "border-rose-200 bg-rose-50 text-rose-700"
+                  : "border-teal-200 bg-teal-50/70 text-teal-800"
+              }`}
+            >
+              {actionError || agendaNotice}
+            </div>
+          )}
+
           <section
             className="rounded-[22px] border border-[var(--border)] bg-[var(--surface)] p-5"
             style={{ boxShadow: "var(--shadow-card)" }}
@@ -1266,30 +1489,251 @@ export function StaffDashboard() {
               </p>
             ) : (
               <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-                {appointments.map((appt) => (
-                  <div
-                    key={appt.appointment_id}
-                    className="rounded-2xl border border-emerald-200/80 bg-emerald-50/40 p-4"
-                  >
-                    <div className="flex items-center justify-between text-xs">
-                      <span className="font-semibold text-emerald-800">
-                        #{appt.appointment_id.slice(0, 8).toUpperCase()}
-                      </span>
-                      <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-[11px] font-medium text-emerald-800">
-                        {appt.specialty_label}
-                      </span>
+                {appointments.map((appt) => {
+                  const isCancelling = cancellingId === appt.appointment_id;
+                  const isRescheduling = reschedulingId === appt.appointment_id;
+                  return (
+                    <div
+                      key={appt.appointment_id}
+                      className="flex flex-col justify-between rounded-2xl border border-emerald-200/80 bg-emerald-50/40 p-4"
+                    >
+                      <div>
+                        <div className="flex items-center justify-between text-xs">
+                          <span className="font-semibold text-emerald-800">
+                            #{appt.appointment_id.slice(0, 8).toUpperCase()}
+                          </span>
+                          <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-[11px] font-medium text-emerald-800">
+                            {appt.specialty_label}
+                          </span>
+                        </div>
+                        <p className="mt-2 text-sm font-semibold text-[var(--text)]">
+                          {appt.patient_name || "Paciente sem nome"}
+                        </p>
+                        <p className="mt-0.5 text-xs text-[var(--muted)]">{appt.doctor_name}</p>
+                        <p className="mt-1 flex items-center gap-1.5 text-xs text-[var(--muted)]">
+                          <Clock className="h-3.5 w-3.5" />
+                          {formatDateTimeBr(appt.starts_at)}
+                        </p>
+                      </div>
+
+                      {!isCancelling && !isRescheduling && (
+                        <div className="mt-3 flex gap-2 border-t border-emerald-200/60 pt-3">
+                          <button
+                            type="button"
+                            disabled={actionBusy}
+                            onClick={() => void handleOpenReschedule(appt)}
+                            className="inline-flex flex-1 items-center justify-center gap-1 rounded-xl border border-emerald-300/80 bg-white px-2.5 py-1.5 text-[11px] font-semibold text-emerald-800 transition-colors hover:bg-emerald-50 disabled:opacity-45"
+                          >
+                            <CalendarPlus className="h-3 w-3" />
+                            Remarcar
+                          </button>
+                          <button
+                            type="button"
+                            disabled={actionBusy}
+                            onClick={() => {
+                              setReschedulingId(null);
+                              setCancellingId(appt.appointment_id);
+                              setCancelReason("");
+                            }}
+                            className="inline-flex flex-1 items-center justify-center gap-1 rounded-xl border border-rose-200 bg-white px-2.5 py-1.5 text-[11px] font-semibold text-rose-700 transition-colors hover:bg-rose-50 disabled:opacity-45"
+                          >
+                            <XCircle className="h-3 w-3" />
+                            Cancelar
+                          </button>
+                        </div>
+                      )}
+
+                      {isRescheduling && (
+                        <div className="mt-3 space-y-2 border-t border-emerald-200/60 pt-3">
+                          <select
+                            value={rescheduleTargetSlotId}
+                            onChange={(e) =>
+                              setRescheduleTargetSlotId(
+                                e.target.value ? Number(e.target.value) : "",
+                              )
+                            }
+                            disabled={actionBusy || rescheduleSlots.length === 0}
+                            className="w-full rounded-xl border border-[var(--border)] bg-white px-2.5 py-1.5 text-[11px] focus:border-[var(--primary)] focus:outline-none"
+                          >
+                            {rescheduleSlots.length === 0 ? (
+                              <option value="">Sem horários livres</option>
+                            ) : (
+                              rescheduleSlots.map((s) => (
+                                <option key={s.slot_id} value={s.slot_id}>
+                                  {s.specialty_label} · {s.display_label}
+                                </option>
+                              ))
+                            )}
+                          </select>
+                          <div className="flex gap-1.5">
+                            <button
+                              type="button"
+                              disabled={!rescheduleTargetSlotId || actionBusy}
+                              onClick={() => void handleConfirmReschedule(appt.appointment_id)}
+                              className="flex-1 rounded-xl bg-[var(--primary)] py-1.5 text-[11px] font-semibold text-white transition-colors hover:bg-[var(--primary-hover)] disabled:opacity-45"
+                            >
+                              Confirmar troca
+                            </button>
+                            <button
+                              type="button"
+                              disabled={actionBusy}
+                              onClick={() => setReschedulingId(null)}
+                              className="rounded-xl border border-[var(--border)] bg-white px-2.5 py-1.5 text-[11px] text-[var(--muted)] hover:text-[var(--text)]"
+                            >
+                              Voltar
+                            </button>
+                          </div>
+                        </div>
+                      )}
+
+                      {isCancelling && (
+                        <div className="mt-3 space-y-2 border-t border-rose-200/70 pt-3">
+                          <input
+                            type="text"
+                            placeholder="Motivo (opcional)"
+                            value={cancelReason}
+                            onChange={(e) => setCancelReason(e.target.value)}
+                            disabled={actionBusy}
+                            className="w-full rounded-xl border border-rose-200 bg-white px-2.5 py-1.5 text-[11px] focus:border-rose-400 focus:outline-none"
+                          />
+                          <div className="flex gap-1.5">
+                            <button
+                              type="button"
+                              disabled={actionBusy}
+                              onClick={() =>
+                                void handleConfirmCancelAppointment(appt.appointment_id)
+                              }
+                              className="flex-1 rounded-xl bg-rose-600 py-1.5 text-[11px] font-semibold text-white transition-colors hover:bg-rose-700 disabled:opacity-45"
+                            >
+                              Confirmar
+                            </button>
+                            <button
+                              type="button"
+                              disabled={actionBusy}
+                              onClick={() => {
+                                setCancellingId(null);
+                                setCancelReason("");
+                              }}
+                              className="rounded-xl border border-[var(--border)] bg-white px-2.5 py-1.5 text-[11px] text-[var(--muted)] hover:text-[var(--text)]"
+                            >
+                              Voltar
+                            </button>
+                          </div>
+                        </div>
+                      )}
                     </div>
-                    <p className="mt-2 text-sm font-semibold text-[var(--text)]">
-                      {appt.doctor_name}
-                    </p>
-                    <p className="mt-1 flex items-center gap-1.5 text-xs text-[var(--muted)]">
-                      <Clock className="h-3.5 w-3.5" />
-                      {formatDateTimeBr(appt.starts_at)}
-                    </p>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             )}
+          </section>
+
+          <section
+            className="rounded-[22px] border border-[var(--border)] bg-[var(--surface)] p-5"
+            style={{ boxShadow: "var(--shadow-card)" }}
+          >
+            <h2 className="flex items-center gap-2 text-sm font-semibold text-[var(--text)]">
+              <Plus className="h-4 w-4 text-[var(--primary)]" />
+              Gerar Horários em Lote
+            </h2>
+            <form
+              onSubmit={(e) => void handleCreateSlotsBatch(e)}
+              className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-6"
+            >
+              <div>
+                <label className="mb-1 block text-[11px] font-medium text-[var(--muted)]">
+                  Especialidade
+                </label>
+                <select
+                  value={batchSpecialty}
+                  onChange={(e) => setBatchSpecialty(e.target.value as Specialty)}
+                  className="w-full rounded-xl border border-[var(--border)] bg-[var(--surface)] px-2.5 py-2 text-xs focus:border-[var(--primary)] focus:outline-none"
+                >
+                  <option value="clinica_geral">Clínica Geral</option>
+                  <option value="ortopedia">Ortopedia</option>
+                  <option value="dermatologia">Dermatologia</option>
+                  <option value="cardiologia">Cardiologia</option>
+                </select>
+              </div>
+              <div>
+                <label className="mb-1 block text-[11px] font-medium text-[var(--muted)]">
+                  Profissional
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={batchDoctor}
+                  onChange={(e) => setBatchDoctor(e.target.value)}
+                  className="w-full rounded-xl border border-[var(--border)] bg-[var(--surface)] px-2.5 py-2 text-xs focus:border-[var(--primary)] focus:outline-none"
+                />
+              </div>
+              <div>
+                <label className="mb-1 block text-[11px] font-medium text-[var(--muted)]">
+                  Data
+                </label>
+                <input
+                  type="date"
+                  required
+                  value={batchDate}
+                  onChange={(e) => setBatchDate(e.target.value)}
+                  className="w-full rounded-xl border border-[var(--border)] bg-[var(--surface)] px-2.5 py-2 text-xs focus:border-[var(--primary)] focus:outline-none"
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="mb-1 block text-[11px] font-medium text-[var(--muted)]">
+                    Início (h)
+                  </label>
+                  <input
+                    type="number"
+                    min={6}
+                    max={21}
+                    value={batchStartHour}
+                    onChange={(e) => setBatchStartHour(Number(e.target.value))}
+                    className="w-full rounded-xl border border-[var(--border)] bg-[var(--surface)] px-2.5 py-2 text-xs focus:border-[var(--primary)] focus:outline-none"
+                  />
+                </div>
+                <div>
+                  <label className="mb-1 block text-[11px] font-medium text-[var(--muted)]">
+                    Fim (h)
+                  </label>
+                  <input
+                    type="number"
+                    min={7}
+                    max={22}
+                    value={batchEndHour}
+                    onChange={(e) => setBatchEndHour(Number(e.target.value))}
+                    className="w-full rounded-xl border border-[var(--border)] bg-[var(--surface)] px-2.5 py-2 text-xs focus:border-[var(--primary)] focus:outline-none"
+                  />
+                </div>
+              </div>
+              <div>
+                <label className="mb-1 block text-[11px] font-medium text-[var(--muted)]">
+                  Intervalo (min)
+                </label>
+                <select
+                  value={batchInterval}
+                  onChange={(e) => setBatchInterval(Number(e.target.value))}
+                  className="w-full rounded-xl border border-[var(--border)] bg-[var(--surface)] px-2.5 py-2 text-xs focus:border-[var(--primary)] focus:outline-none"
+                >
+                  <option value={15}>15 min</option>
+                  <option value={20}>20 min</option>
+                  <option value={30}>30 min</option>
+                  <option value={45}>45 min</option>
+                  <option value={60}>60 min</option>
+                </select>
+              </div>
+              <div className="flex items-end">
+                <button
+                  type="submit"
+                  disabled={actionBusy || !batchDate || !batchDoctor.trim()}
+                  className="inline-flex w-full items-center justify-center gap-1.5 rounded-xl bg-[var(--primary)] px-3 py-2 text-xs font-semibold text-white transition-colors hover:bg-[var(--primary-hover)] disabled:opacity-45"
+                >
+                  <Plus className="h-3.5 w-3.5" />
+                  Adicionar
+                </button>
+              </div>
+            </form>
           </section>
 
           <section
@@ -1323,20 +1767,119 @@ export function StaffDashboard() {
               {slots.map((slot) => (
                 <div
                   key={slot.slot_id}
-                  className="rounded-2xl border border-[var(--border)] bg-[var(--surface-muted)]/45 p-3.5"
+                  className="flex items-start justify-between gap-2 rounded-2xl border border-[var(--border)] bg-[var(--surface-muted)]/45 p-3.5"
                 >
-                  <span className="text-[11px] font-semibold uppercase tracking-wide text-[var(--primary)]">
-                    {slot.specialty_label}
-                  </span>
-                  <p className="mt-1 text-sm font-semibold text-[var(--text)]">
-                    {slot.doctor_name}
-                  </p>
-                  <p className="mt-1 text-xs text-[var(--muted)]">
-                    {formatDateTimeBr(slot.starts_at)}
-                  </p>
+                  <div className="min-w-0">
+                    <span className="text-[11px] font-semibold uppercase tracking-wide text-[var(--primary)]">
+                      {slot.specialty_label}
+                    </span>
+                    <p className="mt-1 truncate text-sm font-semibold text-[var(--text)]">
+                      {slot.doctor_name}
+                    </p>
+                    <p className="mt-1 text-xs text-[var(--muted)]">
+                      {formatDateTimeBr(slot.starts_at)}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    disabled={actionBusy}
+                    onClick={() => void handleDeleteSlot(slot.slot_id)}
+                    title="Remover horário livre"
+                    aria-label="Remover horário livre"
+                    className="rounded-lg p-1.5 text-[var(--muted)] transition-colors hover:bg-rose-50 hover:text-rose-600 disabled:opacity-45"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </button>
                 </div>
               ))}
             </div>
+          </section>
+
+          <section
+            className="rounded-[22px] border border-[var(--border)] bg-[var(--surface)] p-5"
+            style={{ boxShadow: "var(--shadow-card)" }}
+          >
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h2 className="flex items-center gap-2 text-sm font-semibold text-[var(--text)]">
+                  <Bell className="h-4 w-4 text-[var(--primary)]" />
+                  Lembretes Programados ({reminders.length})
+                </h2>
+                <p className="mt-0.5 text-xs text-[var(--muted)]">
+                  Avisos automáticos 24h e 2h antes da consulta.
+                </p>
+              </div>
+              <button
+                type="button"
+                disabled={actionBusy || reminders.length === 0}
+                onClick={() => void handleDispatchDueReminders()}
+                className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 text-xs font-semibold text-[var(--text)] transition-colors hover:bg-[var(--surface-muted)] disabled:opacity-45"
+              >
+                <Send className="h-3.5 w-3.5 text-[var(--primary)]" />
+                Processar vencidos
+              </button>
+            </div>
+
+            {reminders.length === 0 ? (
+              <p className="mt-4 text-xs text-[var(--muted)]">
+                Nenhum lembrete programado no momento.
+              </p>
+            ) : (
+              <div className="mt-4 space-y-2.5">
+                {reminders.map((rem) => {
+                  const statusBadge =
+                    rem.status === "sent"
+                      ? { label: "Enviado", cls: "bg-emerald-100 text-emerald-800" }
+                      : rem.status === "cancelled"
+                        ? { label: "Cancelado", cls: "bg-slate-100 text-slate-600" }
+                        : rem.status === "failed"
+                          ? { label: "Falhou", cls: "bg-rose-100 text-rose-700" }
+                          : { label: "Pendente", cls: "bg-amber-100 text-amber-800" };
+                  return (
+                    <div
+                      key={rem.reminder_id}
+                      className="flex flex-col justify-between gap-3 rounded-2xl border border-[var(--border)] bg-[var(--surface-muted)]/35 p-3.5 sm:flex-row sm:items-center"
+                    >
+                      <div className="min-w-0 space-y-1">
+                        <div className="flex flex-wrap items-center gap-2 text-xs">
+                          <span className="font-semibold text-[var(--text)]">
+                            {rem.patient_name}
+                          </span>
+                          <span className="rounded-full bg-[var(--primary-soft)] px-2 py-0.5 text-[10px] font-semibold uppercase text-[var(--primary)]">
+                            {rem.reminder_type}
+                          </span>
+                          <span
+                            className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${statusBadge.cls}`}
+                          >
+                            {statusBadge.label}
+                          </span>
+                          <span className="rounded-full border border-[var(--border)] bg-white px-2 py-0.5 text-[10px] text-[var(--muted)]">
+                            {rem.channel}
+                          </span>
+                        </div>
+                        <p className="text-xs text-[var(--text)]/85">{rem.message_preview}</p>
+                        <p className="text-[11px] text-[var(--muted)]">
+                          Previsto: {formatDateTimeBr(rem.scheduled_for)}
+                          {rem.recipient_phone ? ` · Tel: ${rem.recipient_phone}` : ""}
+                          {rem.recipient_email ? ` · E-mail: ${rem.recipient_email}` : ""}
+                        </p>
+                      </div>
+                      {(rem.status === "pending" || rem.status === "failed") && (
+                        <button
+                          type="button"
+                          disabled={actionBusy}
+                          onClick={() => void handleSendReminderNow(rem.reminder_id)}
+                          className="inline-flex shrink-0 items-center justify-center gap-1.5 rounded-xl bg-[var(--primary-soft)] px-3 py-1.5 text-xs font-semibold text-[var(--primary)] transition-colors hover:bg-[var(--primary)] hover:text-white disabled:opacity-45"
+                        >
+                          <Send className="h-3.5 w-3.5" />
+                          Enviar agora
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </section>
         </div>
       )}

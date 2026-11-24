@@ -8,6 +8,10 @@ from enum import StrEnum
 from pydantic import BaseModel
 
 
+class NoticeWindowError(ValueError):
+    """Raised when self-service cancel/reschedule violates the minimum notice window."""
+
+
 class Specialty(StrEnum):
     """Supported medical specialties for initial appointment routing."""
 
@@ -82,8 +86,26 @@ class BookedAppointmentDTO(BaseModel):
 
     appointment_id: str
     slot_id: int
+    patient_name: str | None = None
     specialty: Specialty
     specialty_label: str
     doctor_name: str
     starts_at: datetime
     status: str = "confirmed"
+
+
+class ReminderDTO(BaseModel):
+    """Scheduled or dispatched appointment reminder."""
+
+    reminder_id: int
+    appointment_id: str
+    patient_name: str
+    recipient_phone: str | None = None
+    recipient_email: str | None = None
+    reminder_type: str
+    channel: str
+    scheduled_for: datetime
+    status: str
+    message_preview: str
+    sent_at: datetime | None = None
+    last_error: str | None = None

@@ -110,18 +110,33 @@ def test_full_api_lifecycle_persistence_quick_replies_and_lgpd_delete(tmp_path: 
         assert t1.json()["reply"]["used_llm"] is True
         assert t1.json()["missing_fields"] == [
             "date_of_birth",
+            "phone",
             "coverage_type",
             "chief_complaint",
         ]
 
-        # 3. Exact date -> 0 tokens fast-path, surfaces quick_replies for coverage_type
+        # 3. Exact date -> 0 tokens fast-path
         t2 = client.post(
             f"/api/v1/sessions/{session_id}/messages",
             json={"message": "22/07/1991"},
         )
         assert t2.status_code == 200
         assert t2.json()["reply"]["used_llm"] is False
-        assert t2.json()["quick_replies"] == [
+        assert t2.json()["missing_fields"] == [
+            "phone",
+            "coverage_type",
+            "chief_complaint",
+        ]
+
+        # 3b. Brazilian phone -> 0 tokens fast-path, surfaces quick_replies for coverage_type
+        t_phone = client.post(
+            f"/api/v1/sessions/{session_id}/messages",
+            json={"message": "51998765432"},
+        )
+        assert t_phone.status_code == 200
+        assert t_phone.json()["reply"]["used_llm"] is False
+        assert t_phone.json()["reply"]["patient_info"]["phone"] == "(51) 99876-5432"
+        assert t_phone.json()["quick_replies"] == [
             {"label": "Convênio", "value": "convênio"},
             {"label": "Particular", "value": "particular"},
         ]
@@ -178,9 +193,10 @@ def test_full_api_lifecycle_persistence_quick_replies_and_lgpd_delete(tmp_path: 
             restored = get_res.json()
             assert restored["status"] == "completed"
             assert restored["patient_info"]["full_name"] == "Juliana Costa"
+            assert restored["patient_info"]["phone"] == "(51) 99876-5432"
             assert restored["patient_info"]["coverage_type"] == "particular"
             assert restored["booked_appointment"] is not None
-            assert len(restored["messages"]) == 13
+            assert len(restored["messages"]) == 15
 
             # 9. LGPD delete removes session and returns 404 afterward
             del_res = fresh_client.delete(f"/api/v1/sessions/{session_id}")

@@ -32,6 +32,7 @@ class ConversationState(BaseModel):
     handoff_reason: str | None = None
     assigned_staff_name: str | None = None
     booked_appointment: BookedAppointmentDTO | None = None
+    reschedule_appointment_id: str | None = None
 
 
 class AgentReply(BaseModel):

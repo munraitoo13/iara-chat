@@ -2,9 +2,13 @@ import type {
   AppointmentSlotDTO,
   BookedAppointmentDTO,
   ConversationStatus,
+  DispatchRemindersResponse,
   HealthResponse,
+  ReminderDTO,
   SessionResponse,
   Specialty,
+  StaffBatchSlotsRequest,
+  StaffCreateSlotRequest,
   StaffExtractResponse,
   StaffSessionSummary,
   StaffUpdatePatientRequest,
@@ -216,6 +220,97 @@ export function staffExtractPatient(
 ): Promise<StaffExtractResponse> {
   return requestJson<StaffExtractResponse>(
     `/staff/sessions/${sessionId}/extract`,
+    { method: "POST" },
+    staffKey,
+  );
+}
+
+export function staffCreateSlot(
+  payload: StaffCreateSlotRequest,
+  staffKey: string | null,
+): Promise<AppointmentSlotDTO> {
+  return requestJson<AppointmentSlotDTO>(
+    "/staff/slots",
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+    staffKey,
+  );
+}
+
+export function staffCreateSlotsBatch(
+  payload: StaffBatchSlotsRequest,
+  staffKey: string | null,
+): Promise<AppointmentSlotDTO[]> {
+  return requestJson<AppointmentSlotDTO[]>(
+    "/staff/slots/batch",
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+    staffKey,
+  );
+}
+
+export function staffDeleteSlot(slotId: number, staffKey: string | null): Promise<void> {
+  return requestJson<void>(`/staff/slots/${slotId}`, { method: "DELETE" }, staffKey);
+}
+
+export function staffCancelAppointment(
+  appointmentId: string,
+  reason: string | null,
+  staffKey: string | null,
+): Promise<BookedAppointmentDTO> {
+  return requestJson<BookedAppointmentDTO>(
+    `/staff/appointments/${appointmentId}/cancel`,
+    {
+      method: "POST",
+      body: JSON.stringify({ reason: reason || null }),
+    },
+    staffKey,
+  );
+}
+
+export function staffRescheduleAppointment(
+  appointmentId: string,
+  newSlotId: number,
+  staffKey: string | null,
+): Promise<BookedAppointmentDTO> {
+  return requestJson<BookedAppointmentDTO>(
+    `/staff/appointments/${appointmentId}/reschedule`,
+    {
+      method: "POST",
+      body: JSON.stringify({ new_slot_id: newSlotId }),
+    },
+    staffKey,
+  );
+}
+
+export function staffListReminders(
+  staffKey: string | null,
+  status?: string,
+): Promise<ReminderDTO[]> {
+  const query = status ? `?status=${encodeURIComponent(status)}` : "";
+  return requestJson<ReminderDTO[]>(`/staff/reminders${query}`, {}, staffKey);
+}
+
+export function staffSendReminderNow(
+  reminderId: number,
+  staffKey: string | null,
+): Promise<ReminderDTO> {
+  return requestJson<ReminderDTO>(
+    `/staff/reminders/${reminderId}/send-now`,
+    { method: "POST" },
+    staffKey,
+  );
+}
+
+export function staffDispatchDueReminders(
+  staffKey: string | null,
+): Promise<DispatchRemindersResponse> {
+  return requestJson<DispatchRemindersResponse>(
+    "/staff/reminders/dispatch-due",
     { method: "POST" },
     staffKey,
   );

@@ -23,6 +23,10 @@ class Settings(BaseSettings):
     max_input_chars: int = 1000
     max_turns: int = 30
     session_timeout_minutes: int = 20
+    min_cancel_notice_hours: int = 2
+
+    resend_api_key: SecretStr | None = None
+    resend_from_email: str = "Iara <onboarding@resend.dev>"
 
     database_url: str = "sqlite:///./data/iara.db"
     cors_origins: str = (
@@ -82,6 +86,14 @@ class Settings(BaseSettings):
         if self.staff_api_key is None:
             return None
         val = self.staff_api_key.get_secret_value().strip()
+        return val or None
+
+    def configured_resend_api_key(self) -> str | None:
+        """Return non-empty Resend API key when configured, else None."""
+
+        if self.resend_api_key is None:
+            return None
+        val = self.resend_api_key.get_secret_value().strip()
         return val or None
 
 

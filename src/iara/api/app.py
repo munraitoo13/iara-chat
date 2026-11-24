@@ -1,9 +1,10 @@
 """FastAPI application factory, REST endpoints, scheduling, and staff handoff routes."""
 
+import asyncio
 import hmac
 import sys
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Annotated
 
@@ -16,14 +17,19 @@ from pydantic import ValidationError
 
 from iara.api.schemas import (
     CreateMessageRequest,
+    DispatchRemindersResponse,
     HealthResponse,
     MessageDTO,
     SessionResponse,
+    StaffBatchSlotsRequest,
     StaffBookAppointmentRequest,
+    StaffCancelAppointmentRequest,
     StaffCloseRequest,
+    StaffCreateSlotRequest,
     StaffExtractResponse,
     StaffMessageRequest,
     StaffOfferSlotsRequest,
+    StaffRescheduleAppointmentRequest,
     StaffSessionSummary,
     StaffTakeoverRequest,
     StaffUpdatePatientRequest,
@@ -40,10 +46,13 @@ from iara.models.patient import CoverageType
 from iara.models.scheduling import (
     AppointmentSlotDTO,
     BookedAppointmentDTO,
+    NoticeWindowError,
+    ReminderDTO,
     Specialty,
     suggest_specialty_from_complaint,
 )
 from iara.services.llm import LLMClient, LLMError, create_llm_client
+from iara.services.reminders import ReminderSender, create_reminder_sender
 
 _WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 
@@ -113,6 +122,7 @@ def create_app(
     settings: Settings | None = None,
     llm: LLMClient | None = None,
     repository: SessionRepository | None = None,
+    reminder_sender: ReminderSender | None = None,
 ) -> FastAPI:
     """Create and configure the FastAPI application with injected or lazy dependencies."""
 
@@ -121,12 +131,29 @@ def create_app(
     active_repo = repository or SessionRepository(
         create_db_engine(active_settings.database_url),
         session_timeout_minutes=active_settings.session_timeout_minutes,
+        min_cancel_notice_hours=active_settings.min_cancel_notice_hours,
     )
+    default_channel, default_sender = create_reminder_sender(active_settings)
+    active_sender = reminder_sender or default_sender
+    active_channel = default_channel if reminder_sender is None else "mock"
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         active_repo.init_db()
-        yield
+        active_repo.dispatch_due_reminders(active_sender, active_channel)
+
+        async def _reminder_loop() -> None:
+            while True:
+                await asyncio.sleep(60)
+                active_repo.dispatch_due_reminders(active_sender, active_channel)
+
+        task = asyncio.create_task(_reminder_loop())
+        try:
+            yield
+        finally:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
 
     app = FastAPI(
         title="Iara Chat API",
@@ -227,6 +254,7 @@ def create_app(
             state=loaded.state,
             scheduler=active_repo,
             session_id=session_id,
+            min_cancel_notice_hours=active_settings.min_cancel_notice_hours,
         )
         reply = agent.handle_message(payload.message)
         active_repo.save_turn(session_id, agent.state, previous_count, reply)
@@ -506,6 +534,152 @@ def create_app(
             suggested_specialty=suggested,
             warnings=warnings,
         )
+
+    @app.post(
+        "/api/v1/staff/slots",
+        response_model=AppointmentSlotDTO,
+        status_code=status.HTTP_201_CREATED,
+        dependencies=[Depends(require_staff_key)],
+        tags=["staff"],
+    )
+    def staff_create_slot(payload: StaffCreateSlotRequest) -> AppointmentSlotDTO:
+        return active_repo.create_slot(
+            specialty=payload.specialty,
+            doctor_name=payload.doctor_name,
+            starts_at=payload.starts_at,
+        )
+
+    @app.post(
+        "/api/v1/staff/slots/batch",
+        response_model=list[AppointmentSlotDTO],
+        status_code=status.HTTP_201_CREATED,
+        dependencies=[Depends(require_staff_key)],
+        tags=["staff"],
+    )
+    def staff_create_slots_batch(payload: StaffBatchSlotsRequest) -> list[AppointmentSlotDTO]:
+        try:
+            return active_repo.create_slots_batch(
+                specialty=payload.specialty,
+                doctor_name=payload.doctor_name,
+                target_date=payload.target_date,
+                start_hour=payload.start_hour,
+                end_hour=payload.end_hour,
+                interval_minutes=payload.interval_minutes,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from None
+
+    @app.delete(
+        "/api/v1/staff/slots/{slot_id}",
+        status_code=status.HTTP_204_NO_CONTENT,
+        dependencies=[Depends(require_staff_key)],
+        tags=["staff"],
+    )
+    def staff_delete_slot(slot_id: int) -> Response:
+        try:
+            deleted = active_repo.delete_slot(slot_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from None
+        if not deleted:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Horário não encontrado.",
+            )
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    @app.post(
+        "/api/v1/staff/appointments/{appointment_id}/cancel",
+        response_model=BookedAppointmentDTO,
+        dependencies=[Depends(require_staff_key)],
+        tags=["staff"],
+    )
+    def staff_cancel_appointment(
+        appointment_id: str,
+        payload: StaffCancelAppointmentRequest | None = None,
+    ) -> BookedAppointmentDTO:
+        reason = payload.reason if payload else None
+        try:
+            cancelled = active_repo.cancel_appointment(
+                appointment_id,
+                reason=reason,
+                enforce_notice_window=False,
+            )
+        except (NoticeWindowError, ValueError) as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from None
+        if cancelled is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Consulta não encontrada.",
+            )
+        return cancelled
+
+    @app.post(
+        "/api/v1/staff/appointments/{appointment_id}/reschedule",
+        response_model=BookedAppointmentDTO,
+        dependencies=[Depends(require_staff_key)],
+        tags=["staff"],
+    )
+    def staff_reschedule_appointment(
+        appointment_id: str,
+        payload: StaffRescheduleAppointmentRequest,
+    ) -> BookedAppointmentDTO:
+        try:
+            updated = active_repo.reschedule_appointment(
+                appointment_id,
+                payload.new_slot_id,
+                enforce_notice_window=False,
+            )
+        except (NoticeWindowError, ValueError) as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from None
+        if updated is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Consulta não encontrada.",
+            )
+        return updated
+
+    @app.get(
+        "/api/v1/staff/reminders",
+        response_model=list[ReminderDTO],
+        dependencies=[Depends(require_staff_key)],
+        tags=["staff"],
+    )
+    def staff_list_reminders(
+        status_filter: Annotated[str | None, Query(alias="status")] = None,
+    ) -> list[ReminderDTO]:
+        return active_repo.list_reminders(status_filter=status_filter)
+
+    @app.post(
+        "/api/v1/staff/reminders/{reminder_id}/send-now",
+        response_model=ReminderDTO,
+        dependencies=[Depends(require_staff_key)],
+        tags=["staff"],
+    )
+    def staff_send_reminder_now(reminder_id: int) -> ReminderDTO:
+        try:
+            dispatched = active_repo.dispatch_reminder_by_id(
+                reminder_id,
+                active_sender,
+                active_channel,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from None
+        if dispatched is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Lembrete não encontrado.",
+            )
+        return dispatched
+
+    @app.post(
+        "/api/v1/staff/reminders/dispatch-due",
+        response_model=DispatchRemindersResponse,
+        dependencies=[Depends(require_staff_key)],
+        tags=["staff"],
+    )
+    def staff_dispatch_due_reminders() -> DispatchRemindersResponse:
+        count = active_repo.dispatch_due_reminders(active_sender, active_channel)
+        return DispatchRemindersResponse(dispatched=count, channel=active_channel)
 
     if _WEB_DIR.is_dir():
         app.mount("/static", StaticFiles(directory=_WEB_DIR), name="static")
