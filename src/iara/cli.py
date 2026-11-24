@@ -32,7 +32,8 @@ def main() -> None:
     )
 
     print(
-        f"=== {settings.clinic_name} ({settings.llm_provider}: {settings.active_model_name()}) ==="
+        f"=== Iara · {settings.clinic_name} "
+        f"({settings.llm_provider}: {settings.active_model_name()}) ==="
     )
     print("Digite 'sair' a qualquer momento para encerrar.\n")
     print(f"Iara: {agent.greeting()}\n")

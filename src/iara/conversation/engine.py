@@ -37,7 +37,7 @@ class IntakeAgent:
     def __init__(
         self,
         llm: LLMClient,
-        clinic_name: str = "Clínica Iara",
+        clinic_name: str = "Clínica Modelo",
         max_input_chars: int = 1000,
         max_turns: int = 30,
         state: ConversationState | None = None,

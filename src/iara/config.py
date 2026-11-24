@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     gemini_api_key: SecretStr | None = None
     gemini_model: str = "gemini-3.5-flash-lite"
 
-    clinic_name: str = "Clínica Iara"
+    clinic_name: str = "Clínica Modelo"
     max_input_chars: int = 1000
     max_turns: int = 30
 

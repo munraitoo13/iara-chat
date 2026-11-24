@@ -149,7 +149,7 @@ function hydrateSession(data) {
   state.llmTurns = 0;
   localStorage.setItem(SESSION_STORAGE_KEY, data.session_id);
 
-  els.clinicName.textContent = `${data.clinic_name} · Triagem Inteligente`;
+  els.clinicName.textContent = `${data.clinic_name} · Atendimento por Iara`;
   els.messages.innerHTML = "";
 
   data.messages.forEach((item, index) => {
@@ -182,7 +182,7 @@ async function fetchHealth() {
     const res = await fetch(`${API_BASE}/health`);
     if (!res.ok) return;
     const data = await res.json();
-    els.clinicName.textContent = `${data.clinic_name} · Triagem Inteligente`;
+    els.clinicName.textContent = `${data.clinic_name} · Atendimento por Iara`;
     els.modelBadge.textContent = `${data.provider}: ${data.model}`;
   } catch {
     els.modelBadge.textContent = "API indisponível";
