@@ -61,6 +61,7 @@ def _build_session_response(
     is_finished = state.status in (
         ConversationStatus.COMPLETED,
         ConversationStatus.EMERGENCY,
+        ConversationStatus.EXPIRED,
     )
 
     messages: list[MessageDTO] = []
@@ -105,7 +106,10 @@ def create_app(
 
     active_settings = settings or get_settings()
     active_llm = llm or create_llm_client(active_settings)
-    active_repo = repository or SessionRepository(create_db_engine(active_settings.database_url))
+    active_repo = repository or SessionRepository(
+        create_db_engine(active_settings.database_url),
+        session_timeout_minutes=active_settings.session_timeout_minutes,
+    )
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:

@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     clinic_name: str = "Clínica Modelo"
     max_input_chars: int = 1000
     max_turns: int = 30
+    session_timeout_minutes: int = 20
 
     database_url: str = "sqlite:///./data/iara.db"
     cors_origins: str = (

@@ -1,8 +1,10 @@
 """Tests for specialty triage, SQLModel scheduling, and human-in-the-loop handoff."""
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+from sqlmodel import Session
 
 from iara.api.app import create_app
 from iara.config import Settings
@@ -13,6 +15,7 @@ from iara.conversation.guardrails import (
     match_specialty_choice,
 )
 from iara.conversation.state import ConversationStatus
+from iara.db.models import IntakeSessionRecord
 from iara.db.repository import SessionRepository, create_db_engine
 from iara.models.extraction import ExtractedPatientFields, TurnAnalysis
 from iara.models.scheduling import Specialty, suggest_specialty_from_complaint
@@ -256,3 +259,67 @@ def test_human_handoff_takeover_polling_release_and_staff_auth(tmp_path: Path) -
         assert closed.status_code == 200
         assert closed.json()["status"] == "completed"
         assert closed.json()["is_finished"] is True
+
+
+def test_session_inactivity_timeout_expires_open_and_takeover_sessions(tmp_path: Path) -> None:
+    db_url = f"sqlite:///{tmp_path / 'timeout.db'}"
+    repo = SessionRepository(create_db_engine(db_url), session_timeout_minutes=20)
+    repo.init_db()
+    settings = Settings(
+        llm_provider="vercel_gateway",
+        ai_gateway_api_key="test-key",
+        database_url=db_url,
+        clinic_name="Clínica Modelo",
+        session_timeout_minutes=20,
+    )
+    app = create_app(settings=settings, llm=StubLLM([]), repository=repo)
+
+    s_stale_collecting = repo.create_session("Clínica Modelo", "Olá").session_id
+    s_stale_takeover = repo.create_session("Clínica Modelo", "Olá").session_id
+    repo.staff_takeover(s_stale_takeover, "Recepção")
+    s_active = repo.create_session("Clínica Modelo", "Olá").session_id
+    s_completed = repo.create_session("Clínica Modelo", "Olá").session_id
+    repo.staff_close_session(s_completed, "Finalizado")
+
+    old_time = datetime.now(UTC) - timedelta(minutes=25)
+    with Session(repo.engine) as db:
+        for sid in (s_stale_collecting, s_stale_takeover, s_completed):
+            rec = db.get(IntakeSessionRecord, sid)
+            assert rec is not None
+            rec.updated_at = old_time
+            db.add(rec)
+        db.commit()
+
+    with TestClient(app) as client:
+        # Stale collecting & human_takeover sessions auto-expire without booking
+        res_stale = client.get(f"/api/v1/sessions/{s_stale_collecting}")
+        assert res_stale.status_code == 200
+        assert res_stale.json()["status"] == "expired"
+        assert res_stale.json()["is_finished"] is True
+        assert res_stale.json()["booked_appointment"] is None
+
+        res_takeover = client.get(f"/api/v1/sessions/{s_stale_takeover}")
+        assert res_takeover.status_code == 200
+        assert res_takeover.json()["status"] == "expired"
+        assert res_takeover.json()["is_finished"] is True
+
+        # Active and already-completed sessions are unaffected
+        assert client.get(f"/api/v1/sessions/{s_active}").json()["status"] == "collecting"
+        assert client.get(f"/api/v1/sessions/{s_completed}").json()["status"] == "completed"
+
+        # Sending a message or trying staff takeover on expired session is handled cleanly
+        msg_expired = client.post(
+            f"/api/v1/sessions/{s_stale_collecting}/messages",
+            json={"message": "Voltei"},
+        )
+        assert msg_expired.status_code == 200
+        assert msg_expired.json()["reply"]["status"] == "expired"
+        assert msg_expired.json()["reply"]["used_llm"] is False
+        assert "inatividade" in msg_expired.json()["reply"]["message"].lower()
+
+        takeover_expired = client.post(
+            f"/api/v1/staff/sessions/{s_stale_collecting}/takeover",
+            json={"staff_name": "Recepção"},
+        )
+        assert takeover_expired.status_code == 409
+        assert repo.list_appointments() == []

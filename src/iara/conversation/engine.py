@@ -103,6 +103,13 @@ class IntakeAgent:
     def handle_message(self, user_input: str) -> AgentReply:
         """Process one user turn via fast-path (0 tokens) or unified 1-call LLM extraction."""
 
+        if self.state.status == ConversationStatus.EXPIRED:
+            return self._build_reply(
+                "Este atendimento foi encerrado por inatividade. "
+                "Inicie uma nova conversa para continuar.",
+                used_llm=False,
+            )
+
         if self.state.status in (ConversationStatus.COMPLETED, ConversationStatus.EMERGENCY):
             return self._build_reply(
                 "Este atendimento já foi encerrado. Inicie uma nova conversa para outro cadastro.",
@@ -291,6 +298,7 @@ class IntakeAgent:
         is_finished = self.state.status in (
             ConversationStatus.COMPLETED,
             ConversationStatus.EMERGENCY,
+            ConversationStatus.EXPIRED,
         )
         return AgentReply(
             message=message,

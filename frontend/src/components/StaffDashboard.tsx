@@ -19,6 +19,8 @@ import {
   Sparkles,
   UserCheck,
   UserRound,
+  Volume2,
+  VolumeX,
   XCircle,
 } from "lucide-react";
 import Link from "next/link";
@@ -36,6 +38,7 @@ import {
   staffSendMessage,
   staffTakeoverSession,
 } from "@/lib/api";
+import { playGentleChime } from "@/lib/sound";
 import type {
   AppointmentSlotDTO,
   BookedAppointmentDTO,
@@ -48,6 +51,7 @@ import type {
 
 const STAFF_KEY_STORAGE = "iara_staff_api_key";
 const STAFF_NAME_STORAGE = "iara_staff_name";
+const STAFF_MUTED_STORAGE = "iara_staff_sound_muted";
 
 type DashboardTab = "queue" | "calendar" | "metrics";
 type QueueFilter = "all" | "waiting_human" | "human_takeover" | "active_ai" | "completed";
@@ -83,6 +87,10 @@ const STATUS_LABELS: Record<
   completed: {
     label: "Concluído",
     className: "bg-slate-100 text-slate-700 border-slate-200",
+  },
+  expired: {
+    label: "Expirado",
+    className: "bg-slate-100 text-slate-500 border-slate-200",
   },
 };
 
@@ -134,12 +142,16 @@ export function StaffDashboard() {
   const [actionBusy, setActionBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
+  const [isMuted, setIsMuted] = useState(false);
+  const [audioBlocked, setAudioBlocked] = useState(false);
 
   useEffect(() => {
     const savedKey = sessionStorage.getItem(STAFF_KEY_STORAGE);
     const savedName = localStorage.getItem(STAFF_NAME_STORAGE);
+    const savedMuted = localStorage.getItem(STAFF_MUTED_STORAGE);
     if (savedKey) setStaffKey(savedKey);
     if (savedName) setStaffName(savedName);
+    if (savedMuted === "true") setIsMuted(true);
   }, []);
 
   const loadDashboardData = useCallback(
@@ -261,7 +273,7 @@ export function StaffDashboard() {
       if (queueFilter === "waiting_human") return s.status === "waiting_human";
       if (queueFilter === "human_takeover") return s.status === "human_takeover";
       if (queueFilter === "completed") {
-        return s.status === "completed" || s.status === "emergency";
+        return s.status === "completed" || s.status === "emergency" || s.status === "expired";
       }
       if (queueFilter === "active_ai") {
         return s.status === "collecting" || s.status === "confirming" || s.status === "scheduling";
@@ -274,6 +286,40 @@ export function StaffDashboard() {
     () => sessions.filter((s) => s.status === "waiting_human").length,
     [sessions],
   );
+  const hasWaiting = waitingCount > 0;
+
+  // Repeat gentle chime every 30s while any session is waiting for human attention
+  useEffect(() => {
+    if (authRequired || isMuted || !hasWaiting) {
+      setAudioBlocked(false);
+      return;
+    }
+
+    let cancelled = false;
+    const triggerPing = () => {
+      void playGentleChime().then((played) => {
+        if (!cancelled) setAudioBlocked(!played);
+      });
+    };
+
+    triggerPing();
+    const intervalId = window.setInterval(triggerPing, 30_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [authRequired, isMuted, hasWaiting]);
+
+  const handleToggleMute = () => {
+    const nextMuted = !isMuted;
+    setIsMuted(nextMuted);
+    localStorage.setItem(STAFF_MUTED_STORAGE, String(nextMuted));
+    if (!nextMuted) {
+      void playGentleChime().then((played) => setAudioBlocked(!played));
+    } else {
+      setAudioBlocked(false);
+    }
+  };
 
   const metrics = useMemo(() => {
     const totalSessions = sessions.length;
@@ -284,6 +330,7 @@ export function StaffDashboard() {
     const escalations = sessions.filter(
       (s) => s.status === "waiting_human" || s.status === "human_takeover" || s.handoff_reason,
     ).length;
+    const expiredCount = sessions.filter((s) => s.status === "expired").length;
 
     return {
       totalSessions,
@@ -292,6 +339,7 @@ export function StaffDashboard() {
       totalTurns,
       savingsPct,
       escalations,
+      expiredCount,
       totalAppointments: appointments.length,
     };
   }, [sessions, appointments]);
@@ -346,7 +394,8 @@ export function StaffDashboard() {
     activeSession &&
     activeSession.status !== "human_takeover" &&
     activeSession.status !== "completed" &&
-    activeSession.status !== "emergency";
+    activeSession.status !== "emergency" &&
+    activeSession.status !== "expired";
 
   const canRelease =
     activeSession &&
@@ -355,7 +404,8 @@ export function StaffDashboard() {
   const canClose =
     activeSession &&
     activeSession.status !== "completed" &&
-    activeSession.status !== "emergency";
+    activeSession.status !== "emergency" &&
+    activeSession.status !== "expired";
 
   return (
     <div className="mx-auto flex min-h-screen max-w-7xl flex-col gap-5 px-4 py-5 sm:px-6">
@@ -399,6 +449,26 @@ export function StaffDashboard() {
               className="w-28 bg-transparent font-medium text-[var(--text)] focus:outline-none"
             />
           </div>
+
+          <button
+            type="button"
+            onClick={handleToggleMute}
+            title={
+              isMuted
+                ? "Ativar alerta sonoro (a cada 30s)"
+                : "Silenciar alerta sonoro"
+            }
+            className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-2 text-xs font-medium transition-colors ${
+              isMuted
+                ? "border-[var(--border)] bg-[var(--surface-muted)] text-[var(--muted)]"
+                : audioBlocked && hasWaiting
+                  ? "border-amber-300 bg-amber-50 text-amber-800"
+                  : "border-[var(--border)] bg-[var(--surface)] text-[var(--text)] hover:bg-[var(--surface-muted)]"
+            }`}
+          >
+            {isMuted ? <VolumeX className="h-3.5 w-3.5" /> : <Volume2 className="h-3.5 w-3.5 text-[var(--primary)]" />}
+            {isMuted ? "Mutado" : audioBlocked && hasWaiting ? "Ativar som" : "Som ativo"}
+          </button>
 
           <button
             type="button"
@@ -899,6 +969,9 @@ export function StaffDashboard() {
                 <UserCheck className="h-4 w-4 text-amber-600" />
               </div>
               <p className="mt-2 text-2xl font-bold text-[var(--text)]">{metrics.escalations}</p>
+              <p className="mt-1 text-[11px] text-[var(--muted)]">
+                {metrics.expiredCount} expiradas por inatividade
+              </p>
             </div>
           </div>
 

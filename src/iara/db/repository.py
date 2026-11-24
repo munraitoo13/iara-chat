@@ -26,6 +26,14 @@ from iara.models.scheduling import (
 
 _CLINIC_TZ = ZoneInfo("America/Sao_Paulo")
 
+_OPEN_STATUSES: tuple[str, ...] = (
+    ConversationStatus.COLLECTING.value,
+    ConversationStatus.CONFIRMING.value,
+    ConversationStatus.SCHEDULING.value,
+    ConversationStatus.WAITING_HUMAN.value,
+    ConversationStatus.HUMAN_TAKEOVER.value,
+)
+
 _SEED_DOCTORS: tuple[tuple[Specialty, str, tuple[int, int]], ...] = (
     (Specialty.GENERAL_PRACTICE, "Dra. Helena Duarte", (9, 14)),
     (Specialty.ORTHOPEDICS, "Dr. Rafael Monteiro", (10, 15)),
@@ -118,8 +126,50 @@ def _appointment_to_dto(record: AppointmentRecord) -> BookedAppointmentDTO:
 class SessionRepository:
     """Persistence adapter for clinical intake sessions, calendar slots, and staff handoff."""
 
-    def __init__(self, engine: Engine) -> None:
+    def __init__(self, engine: Engine, session_timeout_minutes: int = 20) -> None:
         self.engine = engine
+        self.session_timeout_minutes = session_timeout_minutes
+
+    def expire_stale_sessions(self, *, now: datetime | None = None) -> int:
+        """Close idle open sessions beyond the inactivity threshold without booking slots."""
+
+        if self.session_timeout_minutes <= 0:
+            return 0
+
+        ref_now = now or datetime.now(UTC)
+        cutoff = ref_now - timedelta(minutes=self.session_timeout_minutes)
+        expired_count = 0
+
+        with Session(self.engine) as db:
+            open_records = list(
+                db.exec(
+                    select(IntakeSessionRecord).where(
+                        IntakeSessionRecord.status.in_(_OPEN_STATUSES)  # type: ignore[attr-defined]
+                    )
+                ).all()
+            )
+            for rec in open_records:
+                if _ensure_utc(rec.updated_at) <= cutoff:
+                    rec.status = ConversationStatus.EXPIRED.value
+                    rec.updated_at = ref_now
+                    db.add(rec)
+                    db.add(
+                        TranscriptMessageRecord(
+                            session_id=rec.id,
+                            actor="system",
+                            message=(
+                                "Atendimento encerrado automaticamente após "
+                                f"{self.session_timeout_minutes} minutos de inatividade."
+                            ),
+                            used_llm=False,
+                            created_at=ref_now,
+                        )
+                    )
+                    expired_count += 1
+            if expired_count:
+                db.commit()
+
+        return expired_count
 
     def init_db(self) -> None:
         """Create database tables and seed realistic calendar slots idempotently."""
@@ -256,6 +306,7 @@ class SessionRepository:
     def load_session(self, session_id: str) -> LoadedSession | None:
         """Hydrate ConversationState, appointment, and transcript metadata for a session ID."""
 
+        self.expire_stale_sessions()
         with Session(self.engine) as db:
             record = db.get(IntakeSessionRecord, session_id)
             if record is None:
@@ -389,6 +440,7 @@ class SessionRepository:
     def list_sessions(self, status_filter: str | None = None) -> list[StaffSessionRow]:
         """List intake sessions with token efficiency counters for the staff dashboard."""
 
+        self.expire_stale_sessions()
         with Session(self.engine) as db:
             stmt = select(IntakeSessionRecord).order_by(IntakeSessionRecord.updated_at.desc())  # type: ignore[attr-defined]
             if status_filter:
@@ -445,6 +497,7 @@ class SessionRepository:
     def staff_takeover(self, session_id: str, staff_name: str) -> LoadedSession | None:
         """Pause AI automation and assign the conversation to a human staff member."""
 
+        self.expire_stale_sessions()
         with Session(self.engine) as db:
             record = db.get(IntakeSessionRecord, session_id)
             if record is None:
@@ -452,8 +505,9 @@ class SessionRepository:
             if record.status in (
                 ConversationStatus.COMPLETED.value,
                 ConversationStatus.EMERGENCY.value,
+                ConversationStatus.EXPIRED.value,
             ):
-                raise ValueError("Cannot take over a finished or emergency session.")
+                raise ValueError("Cannot take over a finished, emergency, or expired session.")
 
             now = datetime.now(UTC)
             record.status = ConversationStatus.HUMAN_TAKEOVER.value
@@ -483,6 +537,7 @@ class SessionRepository:
     ) -> LoadedSession | None:
         """Append a message sent by a human attendant while session is in takeover mode."""
 
+        self.expire_stale_sessions()
         with Session(self.engine) as db:
             record = db.get(IntakeSessionRecord, session_id)
             if record is None:

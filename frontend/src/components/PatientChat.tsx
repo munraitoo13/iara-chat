@@ -44,6 +44,8 @@ function getStatusBadge(
       };
     case "completed":
       return { label: "Atendimento concluído", dotClass: "bg-emerald-500" };
+    case "expired":
+      return { label: "Encerrado por inatividade", dotClass: "bg-slate-400" };
     case "emergency":
       return { label: "Orientação de urgência", dotClass: "bg-rose-500" };
     default:

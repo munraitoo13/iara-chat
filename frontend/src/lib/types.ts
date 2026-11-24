@@ -5,7 +5,8 @@ export type ConversationStatus =
   | "waiting_human"
   | "human_takeover"
   | "emergency"
-  | "completed";
+  | "completed"
+  | "expired";
 
 export type Specialty = "clinica_geral" | "ortopedia" | "dermatologia" | "cardiologia";
 

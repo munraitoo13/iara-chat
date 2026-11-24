@@ -18,6 +18,7 @@ class ConversationStatus(StrEnum):
     HUMAN_TAKEOVER = "human_takeover"
     EMERGENCY = "emergency"
     COMPLETED = "completed"
+    EXPIRED = "expired"
 
 
 class ConversationState(BaseModel):
