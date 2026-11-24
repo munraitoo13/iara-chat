@@ -1,5 +1,7 @@
 """Behavioral tests for hybrid IntakeAgent, lazy provider settings, and error resilience."""
 
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
@@ -28,7 +30,9 @@ class FakeLLM:
 
 def test_lazy_settings_validates_vercel_gateway_and_gemini_providers(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
+    monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("AI_GATEWAY_API_KEY", raising=False)
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.setenv("LLM_PROVIDER", "vercel_gateway")

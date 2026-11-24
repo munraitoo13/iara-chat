@@ -7,7 +7,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Runtime configuration for the Iara intake assistant."""
+    """Runtime configuration for the Iara intake assistant and API."""
 
     llm_provider: Literal["vercel_gateway", "gemini"] = "vercel_gateway"
 
@@ -22,6 +22,13 @@ class Settings(BaseSettings):
     clinic_name: str = "Clínica Iara"
     max_input_chars: int = 1000
     max_turns: int = 30
+
+    database_url: str = "sqlite:///./data/iara.db"
+    cors_origins: str = (
+        "http://localhost:3000,http://127.0.0.1:3000,http://localhost:8000,http://127.0.0.1:8000"
+    )
+    api_host: str = "127.0.0.1"
+    api_port: int = 8000
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -47,6 +54,11 @@ class Settings(BaseSettings):
         """Return comma-separated fallback model IDs configured for Vercel AI Gateway."""
 
         return [item.strip() for item in self.ai_gateway_fallback_models.split(",") if item.strip()]
+
+    def parsed_cors_origins(self) -> list[str]:
+        """Return comma-separated CORS origins allowed to call the API."""
+
+        return [item.strip() for item in self.cors_origins.split(",") if item.strip()]
 
     def active_model_name(self) -> str:
         """Return the model identifier for the active LLM provider."""

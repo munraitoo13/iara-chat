@@ -40,12 +40,13 @@ class IntakeAgent:
         clinic_name: str = "Clínica Iara",
         max_input_chars: int = 1000,
         max_turns: int = 30,
+        state: ConversationState | None = None,
     ) -> None:
         self.llm = llm
         self.clinic_name = clinic_name
         self.max_input_chars = max_input_chars
         self.max_turns = max_turns
-        self.state = ConversationState()
+        self.state = state or ConversationState()
         self._turn_system_prompt = build_turn_system_prompt(clinic_name)
 
     def greeting(self) -> str:
