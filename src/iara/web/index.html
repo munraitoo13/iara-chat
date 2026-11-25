@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Iara — Triagem Clínica Inteligente</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-badge" aria-hidden="true">I</div>
+        <div>
+          <h1 id="clinic-name">Iara · Triagem Inteligente</h1>
+          <p id="model-badge" class="subtitle">Conectando ao serviço...</p>
+        </div>
+      </div>
+      <div class="topbar-actions">
+        <button id="new-session-btn" class="btn btn-secondary" type="button">Nova triagem</button>
+        <button id="delete-session-btn" class="btn btn-danger-ghost" type="button">
+          Apagar dados (LGPD)
+        </button>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <section class="chat-panel" aria-label="Conversa com a assistente">
+        <div id="messages" class="messages" aria-live="polite"></div>
+
+        <div id="quick-replies" class="quick-replies" hidden></div>
+
+        <form id="chat-form" class="composer">
+          <div class="composer-input-wrap">
+            <input
+              id="message-input"
+              type="text"
+              placeholder="Digite sua resposta aqui..."
+              maxlength="1000"
+              autocomplete="off"
+              required
+            />
+            <span id="char-counter" class="char-counter">0/1000</span>
+          </div>
+          <button id="send-btn" class="btn btn-primary" type="submit">Enviar</button>
+        </form>
+      </section>
+
+      <aside class="summary-panel" aria-label="Ficha de pré-cadastro">
+        <div class="card">
+          <div class="card-header">
+            <h2>Ficha de Pré-Cadastro</h2>
+            <span id="status-pill" class="status-pill status-collecting">Em coleta</span>
+          </div>
+
+          <div class="progress-wrap">
+            <div class="progress-label">
+              <span>Progresso</span>
+              <span id="progress-text">0%</span>
+            </div>
+            <div class="progress-track">
+              <div id="progress-fill" class="progress-fill" style="width: 0%"></div>
+            </div>
+          </div>
+
+          <dl class="fields-grid">
+            <div class="field-row">
+              <dt>Nome completo</dt>
+              <dd id="field-full_name" class="empty">Pendente</dd>
+            </div>
+            <div class="field-row">
+              <dt>Data de nascimento</dt>
+              <dd id="field-date_of_birth" class="empty">Pendente</dd>
+            </div>
+            <div class="field-row">
+              <dt>Endereço</dt>
+              <dd id="field-address" class="empty">Pendente</dd>
+            </div>
+            <div class="field-row">
+              <dt>Atendimento</dt>
+              <dd id="field-coverage_type" class="empty">Pendente</dd>
+            </div>
+            <div id="row-insurance_payer" class="field-row">
+              <dt>Operadora</dt>
+              <dd id="field-insurance_payer" class="empty">Pendente</dd>
+            </div>
+            <div id="row-insurance_id" class="field-row">
+              <dt>Carteirinha</dt>
+              <dd id="field-insurance_id" class="empty">Pendente</dd>
+            </div>
+            <div class="field-row">
+              <dt>Queixa principal</dt>
+              <dd id="field-chief_complaint" class="empty">Pendente</dd>
+            </div>
+          </dl>
+        </div>
+
+        <div class="card telemetry-card">
+          <h3>Eficiência Híbrida</h3>
+          <div class="telemetry-stats">
+            <div>
+              <span class="stat-value" id="stat-fast">0</span>
+              <span class="stat-label">Turnos 0 tokens</span>
+            </div>
+            <div>
+              <span class="stat-value" id="stat-llm">0</span>
+              <span class="stat-label">Chamadas LLM</span>
+            </div>
+          </div>
+          <p class="lgpd-note">
+            Dados armazenados localmente em SQLite apenas para fins de pré-cadastro. Use
+            <strong>Apagar dados (LGPD)</strong> para remover a sessão a qualquer momento.
+          </p>
+        </div>
+      </aside>
+    </main>
+  </div>
+
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

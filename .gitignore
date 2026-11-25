@@ -7,5 +7,22 @@ wheels/
 *.egg-info
 .env
 
+# Local databases
+data/
+*.db
+*.sqlite*
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+
 # Virtual environments
 .venv
+
+# Frontend
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.env*.local
+frontend/next-env.d.ts
+*.tsbuildinfo
